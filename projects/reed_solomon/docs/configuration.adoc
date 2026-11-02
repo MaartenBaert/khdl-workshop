@@ -1,0 +1,120 @@
+[[reed-solomon-configuration]]
+== Configuration
+
+A code is selected at elaboration, not at run time. Every module and interface
+takes it as a type parameter `RS`, and module parameters such as `unroll`
+select the hardware's width and parallelism.
+
+[[reed-solomon-rs-config]]
+=== Choosing a code: rs_config and RsDefault
+
+`rtl/reedsolo.kh` supplies the elaboration-time function
+`rs_config(n, k, m, prim, alpha, fcr) -> type`. It returns the `RS` type that
+is passed to every module and interface. Different configurations can coexist
+as separate instances in one design.
+
+[cols="1,1,3",options="header"]
+|===
+|Parameter |Default |Meaning and constraint
+|n |240 |Codeword symbols, including parity; `k < n < 2**m`.
+|k |224 |Message symbols; strictly positive. `n-k` must be even.
+|m |8 |Bits per symbol; field size `q=2**m`.
+|prim |0x11d |Polynomial-basis reduction polynomial, monic of degree `m`.
+|alpha |2 |Nonzero field element generating all `q-1` nonzero elements.
+|fcr |1 |First consecutive generator root exponent; only 0 or 1 is supported.
+|===
+
+The default `RsDefault` is RS(240,224) over GF(256), correcting up to
+`t=(n-k)/2=8` symbol errors. `R=n-k=2*t` denotes the parity count
+throughout this manual. `rs_config` checks that `alpha` generates the complete
+nonzero field cycle, so invalid polynomial and generator combinations fail
+elaboration. The reduction depends only on `prim`, so `alpha` need not be the
+polynomial-basis element 2.
+
+The generator is `g(x)=product(x + alpha**(fcr+i), i=0..R-1)`.
+`RsEncoder` forms `C(x)=x**R*D(x)+P(x)`, with `P` the remainder of
+`x**R*D(x)` modulo `g(x)`. Field addition is XOR, so the resulting
+codeword is divisible by `g`. Shortened codes require no additional
+leading symbols at the external interface.
+
+[[reed-solomon-rs-members]]
+=== Members supplied by RS
+
+Hardware and elaboration code use these members directly, for example
+`RS.Sym` in a port type or `RS.gf_mul(a, b)` in logic.
+
+[cols="1,3",options="header"]
+|===
+|Members |Meaning
+|n, k, m, prim, alpha, fcr |Primary parameters above.
+|t, q |Correction capability and field size.
+|Sym, SymLong |`m`-bit symbols and `2*m-1`-bit unreduced polynomial products.
+|sym_zero, sym_one, sym_zero_long, sym_one_long |Typed arithmetic constants.
+|lut_exp |`q` entries: powers `alpha**i` for `0 <= i < q-1`;
+entry `q-1` is zero, not a wrapped exponent.
+|lut_inv |`q` entries: multiplicative inverses; entry zero is zero by convention.
+|lut_reduce |Elaborated polynomial-basis reduction coefficients.
+|generator |`R` ascending coefficients of `g`, with its monic leading one implicit.
+|gf_extend, gf_mul_long, gf_reduce, gf_mul |Zero extension, unreduced product,
+reduction, and field multiplication.
+|===
+
+Tables and unroll-specific constants are computed by KHDL during
+elaboration; no generated source or Python table-generation step is needed.
+Calling a GF helper with hardware operands creates combinational logic.
+The helpers do not add hidden registers or handshakes. Field addition uses
+KHDL's native `^` operator on symbols or unreduced products.
+
+[[reed-solomon-unroll-constraints]]
+=== Module parameters and width constraints
+
+All modules default `RS` to `RsDefault`, all unroll factors to 1, and
+available `buffered` flags to false. The Python export CLI defaults to
+`--unroll 16`; that convenience default differs from the module defaults.
+Unroll factors are positive compile-time integers. Increasing them replicates
+or chains arithmetic within a cycle and can change area and timing; cycle
+counts alone do not predict maximum clock frequency.
+
+[cols="1,2,3",options="header"]
+|===
+|Module |Parameter |Constraint / interpretation
+|RsEncoder |unroll |Any positive `U`; message and codeword stream lanes.
+|RsSyndromes |unroll |Any positive `U`; codeword stream and padded-syndrome coordinates.
+|RsBerlekamp |unroll |Must divide `R`; serial algorithm iterations per cycle.
+|RsChien |unroll_chien |Any positive `U`; search positions per cycle and error lane layout.
+|RsChien |unroll_omegas |Must divide `t`; evaluator iterations per cycle.
+|RsForney |unroll |`1 <= U_F <= R`; arithmetic steps per cycle, final cycle may be partial.
+|RsForney |unroll_chien |Position layout inherited from `RsChien`, independent of `U_F`.
+|RsCorrection |unroll |Any positive `U`; output lanes and incoming error lane layout.
+|RsDecoder |parallelism.stream_unroll |One shared width for `RsSyndromes`, `RsChien`, `RsCorrection`, and both external streams.
+|RsDecoder |parallelism.berlekamp_unroll, parallelism.omegas_unroll, parallelism.forney_unroll |Passed to the respective arithmetic stages.
+|RsDecoder |parallelism.berlekamp_instances |Positive frame-parallel BM worker count; defaults to 1, independent of arithmetic unroll.
+|RsDecoder |parallelism.forney_instances |Positive frame-parallel `RsForney` worker count; defaults to 1, independent of arithmetic unroll and BM worker count.
+|RsEncoder, RsSyndromes, RsDecoder |buffered |One optional external input holding beat; see <<reed-solomon-flow-control>>.
+|===
+
+There are no divisibility requirements on `n` or `k` for streaming widths,
+and streaming widths need not be powers of two. Both `RsEncoder` and
+`RsDecoder` widths can exceed `R`, `n`, or the field period `q-1`.
+No cross-width gearbox is provided.
+
+[[reed-solomon-limits]]
+=== Functional limits
+
+* Frames have fixed `n` and `k`; there is no runtime shortening or variable
+  valid-lane count.
+* `RsDecoder` corrects errors at unknown positions, up to `t` per codeword.
+  Erasures are not supported.
+* A detected decoding failure sets `failed` and returns the received message
+  unchanged. `num_errors` is the number of error positions found, including
+  parity positions, not the number of repaired message symbols.
+* Beyond `t` errors, a frame may fail or may be miscorrected (see
+  <<reed-solomon-primer-outcomes>>). There is no post-correction syndrome check.
+  Use an outer integrity check when miscorrection matters.
+* `RsEncoder` does not check its input framing; it must be correct.
+  `RsDecoder` discards a frame whose accepted beat count at `last` is wrong,
+  without producing any output or status for it. A missing `last` prevents
+  resynchronization until a later accepted `last` or reset.
+* Only `fcr=0` and `fcr=1` are supported.
+* Resource use and achievable clock frequency have not been measured; see
+  <<reed-solomon-verification>>.

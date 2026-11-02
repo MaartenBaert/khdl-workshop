@@ -1,0 +1,226 @@
+[[axi4-primer]]
+== AXI4 essentials
+
+This chapter covers the AXI4 concepts that the library's API exposes. It does
+not replace the specification, but it should be enough to use the high-level
+APIs and to follow the rest of this manual. If you already know AXI4, skim
+<<axi4-primer-library>> to see how each concept appears in the API.
+
+[[axi4-primer-roles]]
+=== Managers, Subordinates, and transactions
+
+An AXI4 bus connects a *Manager*, which starts transactions, to a
+*Subordinate*, which serves them. A CPU or DMA engine is a typical Manager; a
+memory controller or a peripheral's register file is a typical Subordinate.
+Older documents call these roles master and slave. An interconnect, such as
+`AxiRouter`, acts as a Subordinate towards its upstream Manager and as a
+Manager towards each downstream Subordinate.
+
+A *transaction* reads or writes a range of bytes. The Manager sends one
+address request that describes the whole range. For a read, the Subordinate
+returns the data. For a write, the Manager sends the data and the Subordinate
+returns a single completion response.
+
+[[axi4-primer-channels]]
+=== Five independent channels
+
+A bus consists of five channels. Each channel carries one kind of message in
+one direction:
+
+[options="header",cols="1,2,4,2"]
+|===
+|Channel |Direction |Carries |Messages
+|AR |Manager → Subordinate |Read address request: ID, start address, burst shape, attributes |One per read
+|R |Subordinate → Manager |Read data, response code, and LAST |One per data beat
+|AW |Manager → Subordinate |Write address request, with the same fields as AR |One per write
+|W |Manager → Subordinate |Write data, byte strobes, and LAST |One per data beat
+|B |Subordinate → Manager |Write response code |One per write
+|===
+
+A read uses AR followed by R. A write uses AW and W, followed by B. Each channel
+has its own flow control, so any channel can stall without stalling the
+others. A Manager can therefore keep several transactions in flight: it can
+send new requests while data for earlier ones is still arriving.
+
+[[axi4-primer-handshake]]
+=== The VALID/READY handshake
+
+All five channels use the same handshake. This manual calls the sending side
+the *Transmitter* and the receiving side the *Receiver*. Each of these
+_channel_ roles is distinct from the Manager/Subordinate _transaction_ roles:
+a Manager transmits on AR, AW, and W but receives on R and B.
+
+The Transmitter presents a payload and raises VALID. The Receiver raises READY
+when it can accept a payload. A *transfer* happens at each rising clock edge
+where both signals are high. A Transmitter that has raised VALID must hold
+VALID and the payload unchanged until that transfer. The library implements
+this handshake for every channel, so application code never drives VALID or
+READY (see <<axi-programming-model>>).
+
+[[axi4-primer-bursts]]
+=== Bursts, beats, and byte lanes
+
+A transaction moves one or more *beats*. Each beat is one transfer on R or W
+and carries one bus width of data. The address request describes all beats at
+once:
+
+* *LEN* is the number of beats minus one. The library's request constructors
+  take the number of beats directly.
+* *SIZE* is the number of bytes per beat, encoded as its base-two logarithm.
+  A beat normally uses the full bus width. A _narrow_ beat uses only some of
+  the bus's byte lanes.
+* *BURST* chooses how the address changes from beat to beat:
+** INCR adds the beat size each beat. Ordinary memory accesses use INCR, with
+   1 to 256 beats.
+** WRAP also increments, but wraps around within an aligned block whose size
+   equals the whole transfer. A cache line fill uses WRAP so that it can start
+   at the word the CPU needs first. Bursts have 2, 4, 8, or 16 beats.
+** FIXED repeats the same address every beat. This suits a peripheral FIFO
+   register. Bursts have 1 to 16 beats.
+
+No burst may cross a 4 KiB address boundary, whatever the bus width. This rule
+lets an interconnect route a whole burst by its start address. Only INCR
+bursts can reach that far. On wide buses the rule limits their length: a
+1024-bit bus allows at most 32 full-width beats within one 4 KiB page.
+
+The bus data is divided into byte *lanes*. Lane _i_ holds data bits
+`[8i+7:8i]` and carries the byte whose address modulo the bus width in bytes
+is _i_. The start address may be unaligned, in which case the first beat uses
+only the lanes from that address upward. Each W beat has a *strobe* bit per lane
+(WSTRB), which selects the bytes the Subordinate writes. A strobe of zero
+writes nothing. The Manager marks the final W beat of a burst with WLAST, and
+the Subordinate marks the final R beat with RLAST.
+
+The following four-beat read shows an AR request (ID 5, address `0x100`,
+LEN 3) followed by four R beats. A transfer occurs in each column where VALID
+and READY are both high. The Manager stalls R for one cycle by lowering RREADY,
+so the Subordinate holds D2 until it transfers.
+
+[wavedrom]
+....
+{
+  "signal": [
+    {"name":"clk", "wave":"p........."},
+    {"name":"ARVALID", "wave":"01.0......"},
+    {"name":"ARREADY", "wave":"0.10......"},
+    {"name":"ARID", "wave":"x=.x......", "data":["5"]},
+    {"name":"ARADDR", "wave":"x=.x......", "data":["0x100"]},
+    {"name":"ARLEN", "wave":"x=.x......", "data":["3"]},
+    {"name":"RVALID", "wave":"0...1....0"},
+    {"name":"RREADY", "wave":"1.....01.."},
+    {"name":"RID", "wave":"x...=....x", "data":["5"]},
+    {"name":"RDATA", "wave":"x...===.=x", "data":["D0","D1","D2","D3"]},
+    {"name":"RLAST", "wave":"0.......10"}
+  ],
+  "head":{"text":"Four-beat read with one R stall"}
+}
+....
+
+[[axi4-primer-responses]]
+=== Responses and errors
+
+Every R beat and every B message carries a two-bit response code:
+
+[options="header",cols="1,4"]
+|===
+|Code |Meaning
+|OKAY |Normal success.
+|EXOKAY |Success of an exclusive access (see <<axi4-primer-other>>).
+|SLVERR |The Subordinate received the request but reported an error.
+|DECERR |No Subordinate exists at the address. This is usually generated by an interconnect.
+|===
+
+An error never shortens a burst. A failed read still returns every beat, and a
+failed write still transfers every W beat before its single B response.
+
+[[axi4-primer-ids]]
+=== IDs and ordering
+
+The Manager tags each AR and AW request with an *ID*. The Subordinate copies
+it into the matching R beats (RID) and B response (BID). IDs determine ordering:
+
+* Transactions in the same direction with the same ID complete in the order
+  they were issued.
+* Transactions with different IDs may complete in any order. R beats of
+  different read IDs may even interleave.
+* Read IDs and write IDs are independent.
+* W beats carry no ID in AXI4. Write data must therefore follow the order of
+  the AW requests, sending each burst completely before the next one starts.
+
+A Manager uses one ID to receive results strictly in order. It uses several
+IDs to let a slow transaction be overtaken by unrelated ones.
+
+The channels also have a few dependencies. W beats may arrive at the
+Subordinate before their AW request. A Subordinate sends B only after it has
+received both the AW request and the final W beat. It sends R only after
+receiving the AR request.
+
+[[axi4-primer-other]]
+=== Attributes, USER signals, and exclusive accesses
+
+Address requests also carry CACHE (cacheability and bufferability), PROT
+(privilege, security, and instruction/data), QOS (a priority hint), and REGION
+(a region identifier for Subordinates with several address windows). Every
+channel can additionally carry USER side-band bits of a system-defined width.
+The library transports all of these fields unchanged; its demonstration
+modules do not interpret them.
+
+LOCK marks an *exclusive access*. A Manager can implement an atomic
+read-modify-write sequence with an exclusive read followed by an exclusive
+write. A Subordinate with an exclusive-access monitor answers EXOKAY when the
+sequence succeeds. A Subordinate without one treats both accesses as normal
+accesses and answers OKAY, which tells the Manager that exclusive accesses are
+not supported there.
+
+[[axi-terminology]]
+=== Terminology and specification references
+
+Terminology was checked on 2026-10-13 against Arm's released
+https://documentation-service.arm.com/static/68b03beb01ae952d9559f9eb[AMBA AXI Protocol Specification, IHI 0022 Issue L]
+(27 August 2025), section A1.3:
+
+[options="header",cols="1,2"]
+|===
+|Context |Terms used here
+|AXI transaction interfaces |Manager initiates requests; Subordinate responds.
+|An individual channel |Transmitter sends the payload and valid; Receiver drives ready.
+|===
+
+Channel views and API types therefore use `Transmitter` and `Receiver`. The
+specification's revision history dates Manager/Subordinate terminology to
+Issue H.b. Its newer editions focus on AXI5, so Issue L establishes terminology
+here, while AXI4 functionality follows
+https://developer.arm.com/-/media/Arm%20Developer%20Community/PDF/IHI0022H_amba_axi_protocol_spec.pdf[Arm IHI 0022H, Part A].
+Arm's
+https://documentation-service.arm.com/static/64819f1516f0f201aa6b963c[AXI-Stream specification, IHI 0051B]
+also uses Transmitter/Receiver. The generic `Channel(T)` is not a complete
+AXI-Stream interface.
+
+The library implements memory-mapped AXI4. AXI4-Lite adapters, AXI-Stream,
+AXI5/ACE extensions, clock-domain crossing, width conversion, and a general
+crossbar are outside its scope.
+
+[[axi4-primer-library]]
+=== How the library maps these concepts
+
+[options="header",cols="2,5"]
+|===
+|AXI4 concept |What the library does
+|VALID/READY handshakes
+|Endpoint objects own the handshake signals. Applications call `push` and `pop`
+ when the corresponding `can_push` or `can_pop` predicate is true.
+|LEN
+|`read_request(C, addr, beats=4)` and `write_request(...)` take the beat count.
+|LAST
+|The APIs generate WLAST and RLAST. They report the final beat to the
+ application and check that peers set LAST correctly.
+|IDs
+|Each Manager endpoint has a fixed ID and receives only its own responses. The
+ Subordinate returns RID/BID for you and enforces same-ID ordering.
+|W ordering
+|The Manager sends W bursts in the order their AW requests reached the bus.
+|Beat addresses and lanes
+|The Subordinate computes each beat's address and permitted byte lanes.
+|Burst legality
+|Requests are checked against the AXI4 rules when submitted or received.
+|===

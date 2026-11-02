@@ -1,0 +1,20 @@
+= KHDL workshop
+:encoding: UTF-8
+:lang: en
+
+These designs exercise KHDL's generic programming facilities through realistic
+hardware implementations. Each project has its own RTL manifest, tests, and
+interface contracts; the compiler, language guidance, and build tools are shared.
+
+* link:reed_solomon.html[Reed–Solomon encoder and decoder]: a quick start,
+  Reed–Solomon primer, stream contract, configuration, timing models and
+  parallelism selection, and a reference for the internal decoder stages.
+* link:axi.html[AXI4 transaction library and FIFO-style channels]: an AXI4
+  primer, Manager and Subordinate transaction APIs, module examples, channel
+  primitives, ordering, reset, and verification limits.
+
+* link:fir.html[Pipelined radix-2 FFA FIR]: signed fixed-point convolution,
+  phase-aware odd parallelism, coefficient loading/clear, elastic pipeline
+  grouping, and verification contracts.
+
+Each manual is a separate offline HTML page with embedded timing diagrams.

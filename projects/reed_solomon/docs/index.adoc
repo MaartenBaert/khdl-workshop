@@ -1,0 +1,110 @@
+[[reed-solomon]]
+= Reed–Solomon encoder and decoder
+
+link:index.html[All projects]
+
+This project provides a parametric Reed–Solomon encoder and decoder written
+in KHDL. `RsEncoder` turns a stream of message symbols into codewords by
+appending parity symbols. `RsDecoder` receives possibly corrupted codewords,
+corrects up to `t` wrong symbols per codeword, and returns the message
+together with the number of errors found and a failure flag.
+
+Both modules take the code as an elaboration-time configuration type. The
+default is RS(240,224) over 8-bit symbols, which corrects up to 8 symbol
+errors per 240-symbol codeword, and any code that meets the constraints in
+<<reed-solomon-configuration>> works the same way. Both stream any positive
+number of symbols per clock cycle. The decoder's internal stages can be
+unrolled or replicated independently to trade area for throughput.
+
+The design is a structural port of an existing VHDL implementation. It also
+serves this repository's main purpose: exercising KHDL's generic programming
+facilities in a realistic design. Source paths in this manual are relative to
+`projects/reed_solomon/`.
+
+[[reed-solomon-quick-start]]
+== Quick start
+
+The following module encodes a message stream and immediately decodes it
+again, using RS(12,6) over 4-bit symbols with three symbols per beat. In a
+real system the codewords would travel through a channel or a memory between
+the two instances.
+
+----
+import reedsolo.[rs_config];
+import reedsolo_interfaces.[RsStream];
+import reedsolo_encoder.[RsEncoder];
+import reedsolo_decoder.[RsDecoder, RsDecoderParallelism];
+
+// RS(12,6) over GF(16): six 4-bit message symbols, six parity symbols, t=3.
+type RS = rs_config(n=12, k=6, m=4, prim=0x13, alpha=3, fcr=0);
+
+pub module Loopback ports(
+    clk: in clock,
+    sync(clk) {
+        rst: in bool,
+        message: interface RsStream(3, decoded=false, RS=RS).Sink,
+        decoded: interface RsStream(3, decoded=true, RS=RS).Source,
+    }
+) {
+    wire codewords: interface RsStream(3, decoded=false, RS=RS);
+    instance RsEncoder(unroll=3, buffered=false, RS=RS) ports(clk, rst, input=message, output=codewords);
+    instance RsDecoder(
+        parallelism=RsDecoderParallelism.new(
+            stream_unroll=3, berlekamp_unroll=1, omegas_unroll=1, forney_unroll=1,
+            berlekamp_instances=1, forney_instances=1,
+        ),
+        buffered=false,
+        RS=RS,
+    ) ports(clk, rst, input=codewords, output=decoded);
+}
+----
+
+The pieces are:
+
+* `rs_config(...)` builds the configuration type `RS`: field, code length, and
+  all derived tables. Passing the same `RS` to every interface and instance
+  lets the compiler reject connections between different codes.
+* `RsStream(3, decoded=false, RS=RS)` is a ready/valid symbol stream carrying three symbols
+  per beat, with `last` marking each frame's final beat. Each message frame
+  here is two beats (`k=6`), and each codeword frame is four beats (`n=12`).
+  The decoded stream adds `num_errors` and `failed` to every beat.
+* `RsEncoder` and `RsDecoder` take the stream width as `unroll` and
+  `parallelism.stream_unroll` respectively. The decoder's other `parallelism`
+  fields select arithmetic unrolling and worker replication; all ones gives the
+  smallest decoder. Omitting `parallelism` selects that default with one
+  symbol per beat.
+
+The Python export tool produces Verilog for the same configuration from the
+repository root:
+
+----
+.venv/bin/python -m projects.reed_solomon.tools.compile --n 12 --k 6 --m 4 --prim 0x13 --alpha 3 --fcr 0 --unroll 3
+----
+
+[[reed-solomon-reading-guide]]
+.Reading guide
+* New to Reed–Solomon codes? <<reed-solomon-primer>> explains the terms used
+  throughout this manual.
+* To connect the encoder or decoder, read <<reed-solomon-streams>>, then
+  <<reed-solomon-encoder>> or <<reed-solomon-decoder>>.
+* To choose a code, read <<reed-solomon-configuration>>. To choose stream widths
+  and decoder parallelism for a throughput target, read
+  <<reed-solomon-performance>>.
+* <<reed-solomon-stages>> documents the decoder's internal stages, for
+  integrators who use them individually and for maintainers.
+
+include::primer.adoc[]
+
+include::streams.adoc[]
+
+include::configuration.adoc[]
+
+include::modules/encoder.adoc[]
+
+include::modules/decoder.adoc[]
+
+include::performance.adoc[]
+
+include::stages.adoc[]
+
+include::verification.adoc[]

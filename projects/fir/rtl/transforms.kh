@@ -1,0 +1,22 @@
+// Division-free radix-2 polynomial multiplication: even, even+odd, odd.
+// This exact same level primitive encodes input samples and coefficient groups.
+pub fn encode_level(width: positive, branches: positive, length: positive,
+    values: [branches][2 * length]int(width)) -> [3 * branches][length]int(width + 1) {
+    var result: [3 * branches][length]int(width + 1) = undef;
+    for (b in 0..branches) {
+        for (i in 0..length) {
+            result[3 * b][i] = values[b][2 * i];
+            result[3 * b + 1][i] = values[b][2 * i] + values[b][2 * i + 1];
+            result[3 * b + 2][i] = values[b][2 * i + 1];
+        }
+    }
+    return result;
+}
+
+pub fn encode_group(C: type, samples: [C.radix]C.Coeff) -> [C.leaves]C.EncodedCoeff {
+    var values = [samples];
+    for (level in 0..C.depth) {
+        values = encode_level(C.coeff_w + level, 3**level, C.radix / 2**(level + 1), values);
+    }
+    return [values[i][0] for i in 0..C.leaves];
+}

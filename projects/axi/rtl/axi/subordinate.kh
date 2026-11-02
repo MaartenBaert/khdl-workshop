@@ -1,0 +1,172 @@
+import channel.endpoints.[Receiver, Transmitter];
+import axi.interfaces.[Axi, SubordinateChannels, subordinate_channels];
+import axi.context.[ContextQueue, context_queue];
+import axi.burst.[valid_request, beat_address, lane_mask];
+
+pub struct ReadRequest(C: type, capacity: positive) { token: uint(0..capacity), address: C.Ar }
+pub struct WriteRequest(C: type, capacity: positive) { token: uint(0..capacity), address: C.Aw }
+pub struct WriteBeat(C: type) { addr: C.Addr, data: C.Data, strb: C.Strobe, last: bool, user: uint(C.wuser_width) }
+
+pub struct ReadPort(C: type, capacity: positive) {
+    type Token = uint(0..capacity);
+    input: Receiver(C.Ar), output: Transmitter(C.R),
+    contexts: ContextQueue(C.Ar, capacity),
+    ref done: [capacity]bool,
+
+    fn can_pop(self) -> bool { return self.input.can_pop() && self.contexts.can_push(); }
+    fn peek(self) -> ReadRequest(C, capacity) {
+        assert(self.can_pop(), "ReadPort.peek(): request required");
+        return ReadRequest(C, capacity).new(token=self.contexts.tail, address=self.input.peek());
+    }
+    fn pop(self) -> ReadRequest(C, capacity) {
+        val request = self.peek();
+        if (self.can_pop()) {
+            val descriptor = self.input.pop();
+            assert(valid_request(C, descriptor), "ReadPort.pop(): malformed AXI4 request");
+            val token = self.contexts.push(descriptor);
+            self.done[token] = false;
+        }
+        return request;
+    }
+    // Different IDs can interleave; the oldest context for each ID owns that
+    // ID's next response. Tokens expire when the final response is enqueued.
+    fn can_respond(self, token: uint(0..capacity)) -> bool {
+        val selected = self.contexts.find_id(self.contexts.descriptors[token].id, ref(self.done));
+        return self.contexts.contains(token) && selected.found && token == selected.token && self.output.can_push();
+    }
+    fn address(self, token: uint(0..capacity)) -> C.Addr {
+        assert(self.contexts.contains(token) && !self.done[token], "ReadPort.address(): live token required");
+        val beat = self.contexts.beats[token];
+        assert(beat < 256, "ReadPort.address(): unfinished burst required");
+        var result: C.Addr = undef;
+        if (beat < 256) { result = beat_address(C, self.contexts.descriptors[token], beat); }
+        return result;
+    }
+    fn strobes(self, token: uint(0..capacity)) -> C.Strobe {
+        assert(self.contexts.contains(token) && !self.done[token], "ReadPort.strobes(): live token required");
+        val beat = self.contexts.beats[token];
+        assert(beat < 256, "ReadPort.strobes(): unfinished burst required");
+        var result: C.Strobe = undef;
+        if (beat < 256) { result = lane_mask(C, self.contexts.descriptors[token], beat); }
+        return result;
+    }
+    fn respond(self, token: uint(0..capacity), data: C.Data, resp: uint(2) = 0,
+               user: uint(C.ruser_width) = 0) -> bool {
+        val available = self.can_respond(token);
+        assert(available, "ReadPort.respond(): can_respond required");
+        var last = false;
+        if (available) {
+            val descriptor = self.contexts.descriptors[token];
+            val beat = self.contexts.beats[token];
+            last = beat == descriptor.len;
+            self.output.push(C.R.new(id=descriptor.id, data=data, resp=resp, last=last, user=user));
+            assert(resp != C.exokay || descriptor.lock, "ReadPort.respond(): EXOKAY requires exclusive request");
+            if (last) { self.done[token] = true; }
+            else {
+                assert(beat < 256, "ReadPort.respond(): beat overflow");
+                if (beat < 256) { self.contexts.beats[token] = beat + 1; }
+            }
+        }
+        return last;
+    }
+    fn retire(self) {
+        for (i in 0..capacity) {
+            if (self.contexts.can_pop() && self.done[self.contexts.head]) { self.contexts.pop(); }
+        }
+    }
+}
+
+pub struct WritePort(C: type, capacity: positive) {
+    type Token = uint(0..capacity);
+    input: Receiver(C.Aw), data: Receiver(C.W), output: Transmitter(C.B),
+    contexts: ContextQueue(C.Aw, capacity),
+    ref done: [capacity]bool,
+    ref data_cursor: uint(0..capacity),
+
+    fn can_pop(self) -> bool { return self.input.can_pop() && self.contexts.can_push(); }
+    fn peek(self) -> WriteRequest(C, capacity) {
+        assert(self.can_pop(), "WritePort.peek(): request required");
+        return WriteRequest(C, capacity).new(token=self.contexts.tail, address=self.input.peek());
+    }
+    fn pop(self) -> WriteRequest(C, capacity) {
+        val request = self.peek();
+        if (self.can_pop()) {
+            val descriptor = self.input.pop();
+            assert(valid_request(C, descriptor), "WritePort.pop(): malformed AXI4 request");
+            val token = self.contexts.push(descriptor);
+            self.done[token] = false;
+        }
+        return request;
+    }
+    fn can_pop_data(self, token: uint(0..capacity)) -> bool {
+        return self.contexts.contains(token) && token == self.data_cursor
+            && self.contexts.beats[token] <= self.contexts.descriptors[token].len
+            && self.data.can_pop();
+    }
+    fn pop_data(self, token: uint(0..capacity)) -> WriteBeat(C) {
+        val available = self.can_pop_data(token);
+        assert(available, "WritePort.pop_data(): can_pop_data required");
+        var result: WriteBeat(C) = undef;
+        if (available) {
+            val descriptor = self.contexts.descriptors[token];
+            val beat = self.contexts.beats[token];
+            val payload = self.data.pop();
+            val last = beat == descriptor.len;
+            assert(payload.last == last, "WritePort.pop_data(): WLAST does not match AWLEN");
+            assert(beat < 256, "WritePort.pop_data(): beat overflow");
+            if (beat < 256) {
+                val mask = lane_mask(C, descriptor, beat);
+                assert((payload.strb & mask) == payload.strb, "WritePort.pop_data(): invalid WSTRB");
+                result = WriteBeat(C).new(addr=beat_address(C, descriptor, beat), data=payload.data,
+                    strb=payload.strb, last=last, user=payload.user);
+                self.contexts.beats[token] = beat + 1;
+            }
+            if (last) {
+                if (self.data_cursor == capacity - 1) { self.data_cursor = 0; }
+                else { self.data_cursor = self.data_cursor + 1; }
+            }
+        }
+        return result;
+    }
+    fn can_complete(self, token: uint(0..capacity)) -> bool {
+        val selected = self.contexts.find_id(self.contexts.descriptors[token].id, ref(self.done));
+        return self.contexts.contains(token) && selected.found && token == selected.token
+            && self.contexts.beats[token] == self.contexts.descriptors[token].len + 1
+            && self.output.can_push();
+    }
+    fn complete(self, token: uint(0..capacity), resp: uint(2) = 0,
+                user: uint(C.buser_width) = 0) {
+        val available = self.can_complete(token);
+        assert(available, "WritePort.complete(): can_complete required");
+        if (available) {
+            assert(resp != C.exokay || self.contexts.descriptors[token].lock,
+                "WritePort.complete(): EXOKAY requires exclusive request");
+            self.output.push(C.B.new(id=self.contexts.descriptors[token].id, resp=resp, user=user));
+            self.done[token] = true;
+        }
+    }
+    fn retire(self) {
+        for (i in 0..capacity) {
+            if (self.contexts.can_pop() && self.done[self.contexts.head]) { self.contexts.pop(); }
+        }
+    }
+}
+
+pub struct Subordinate(C: type, capacity: positive) {
+    channels: SubordinateChannels(C), read: ReadPort(C, capacity), write: WritePort(C, capacity),
+    fn begin(self) { self.channels.begin(); }
+    fn end(self) { self.read.retire(); self.write.retire(); self.channels.end(); }
+}
+
+pub fn subordinate(C: type, bus: RefInterface(Axi(C)), capacity: positive = 2) -> Subordinate(C, capacity) {
+    val channels = subordinate_channels(C, bus);
+    reg r_read_done: [capacity]bool = [false] * capacity;
+    reg r_write_done: [capacity]bool = [false] * capacity;
+    reg r_data_cursor: uint(0..capacity) = 0;
+    return Subordinate(C, capacity).new(channels=channels,
+        read=ReadPort(C, capacity).new(input=channels.ar, output=channels.r,
+            contexts=context_queue(C.Ar, capacity), done=ref(r_read_done)),
+        write=WritePort(C, capacity).new(input=channels.aw, data=channels.w, output=channels.b,
+            contexts=context_queue(C.Aw, capacity), done=ref(r_write_done), data_cursor=ref(r_data_cursor)),
+    );
+}

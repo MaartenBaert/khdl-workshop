@@ -1,0 +1,76 @@
+[[axi-channel]]
+= AXI4 transaction library and FIFO-style channels
+
+link:index.html[All projects]
+
+This project is a KHDL library for writing AXI4 components in terms of
+_transactions_ rather than signals. An application that needs to read memory
+asks for a burst and later receives its data beats; a memory model receives
+requests and answers them. Neither drives a VALID or READY signal, counts
+beats to produce LAST, or knows how many cycles its buffers add. The library
+owns those details and checks the protocol rules it relies on.
+
+The project also exists to stress-test KHDL. The APIs are built from
+interface references, structs holding references to registers that a function
+call creates in the caller's process, generic configuration types, and tuples
+of heterogeneous objects. These features let the same transaction-level code
+work with different buffer implementations, which is hard to express in VHDL
+or Verilog.
+
+[[axi-layers]]
+.Layers
+The library is built in four layers. Each layer uses only the one below it.
+
+[options="header",cols="1,2,3"]
+|===
+|Layer |Sources (`rtl/`) |Purpose
+|Applications
+|`examples/pipeline.kh`, `examples/ram.kh`, `examples/error.kh`, `examples/router.kh`, `examples/copy.kh`
+|Demonstration modules: a register slice, a memory, an error target, an address router, and a copy engine.
+|Transaction APIs
+|`axi/manager.kh`, `axi/subordinate.kh`, `axi/pooled_manager.kh`
+|Issue or serve whole read and write bursts. Track IDs, beat counts, LAST, and outstanding transactions.
+|AXI4 bindings
+|`axi/types.kh`, `axi/interfaces.kh`, `axi/burst.kh`, `axi/context.kh`
+|Configuration, payload structs, the `Axi(C)` bus interface, burst arithmetic, and transaction context queues.
+|Channels
+|`channel/endpoints.kh`, `channel/buffers.kh`
+|A generic ready/valid `Channel(T)` with FIFO-style endpoint and buffer objects.
+|===
+
+[[axi-reading-guide]]
+.Reading guide
+* New to AXI4? <<axi4-primer>> explains the protocol concepts this API uses.
+* Every API here follows the conventions in <<axi-programming-model>>. Read
+  that chapter first.
+* To build a component that issues reads and writes, such as a DMA engine or
+  an accelerator, read <<axi4-manager>>.
+* To build a memory or peripheral that answers requests, read <<axi4-subordinate>>.
+* To forward transactions without changing their IDs, as a router does, read
+  <<axi4-pooled-manager>>.
+* <<axi4-reference>> covers configuration, payload layout, burst rules, and
+  reset. <<axi4-modules>> describes the example modules.
+* <<axi-channel-reference>> documents the channel and buffer primitives that
+  every higher layer is built from.
+
+Each `rtl/` subdirectory is a KHDL namespace: `channel.*`, `axi.*`, and
+`examples.*`. Unless stated otherwise, source paths are relative to
+`projects/axi/`.
+
+include::primer.adoc[]
+
+include::programming_model.adoc[]
+
+include::manager.adoc[]
+
+include::subordinate.adoc[]
+
+include::pooled_manager.adoc[]
+
+include::reference.adoc[]
+
+include::modules.adoc[]
+
+include::channels.adoc[]
+
+include::verification.adoc[]

@@ -1,0 +1,179 @@
+// Structural port of reedsolo_encoder_ent.vhd and _rtl.vhd.
+// Reset is synchronous; r_ variables retain state across rising edges.
+import reedsolo.[RsDefault];
+import reedsolo_interfaces.[RsStream];
+
+pub module RsEncoder(unroll: positive = 1, buffered: bool = false, RS: type = RsDefault) ports(
+    // clock and synchronous reset
+    clk: in clock,
+    sync(clk) {
+        rst: in bool,
+        // input stream
+        input: interface RsStream(unroll, decoded=false, RS=RS).Sink,
+        // output stream
+        output: interface RsStream(unroll, decoded=false, RS=RS).Source,
+    }
+) {
+    const c_input_symbols = (RS.k - 1) % unroll + 1;
+    const c_input_padding = unroll - c_input_symbols;
+    // The final input beat can hold some or all parity, with any remaining
+    // low lanes zero-padded when the entire codeword finishes on that beat.
+    const c_mixed_symbols = min(c_input_padding, 2 * RS.t);
+    const c_output_cycles = (2 * RS.t - c_mixed_symbols) +/ unroll;
+    const c_output_symbols = (RS.n - 1) % unroll + 1;
+    const c_table = generate_table(RS, unroll);
+    wire r_input_ready_cond: sync(clk) bool;
+    wire r_input_ready_uncond: sync(clk) bool;
+    comb {
+        input.ready = (r_input_ready_cond && output.ready) || r_input_ready_uncond;
+    }
+    clocked(clk, sync rst) {
+        reg wire output.data = [RS.sym_zero] * unroll;
+        reg wire output.last = false;
+        reg wire output.valid = false;
+        reg wire r_input_ready_cond = !buffered;
+        reg wire r_input_ready_uncond = true;
+        // input holding registers (only when buffered)
+        reg r_fc_input_data: [unroll]RS.Sym = [RS.sym_zero] * unroll;
+        reg r_fc_input_last: bool = false;
+        reg r_fc_input_valid: bool = false;
+        // output registers
+        reg r_fc_output_data: [unroll]RS.Sym = [RS.sym_zero] * unroll;
+        reg r_fc_output_last: bool = false;
+        reg r_fc_output_valid: bool = false;
+        // Low lanes of the previous input complete the next arithmetic beat.
+        // Aligned messages need no tail storage.
+        reg r_input_tail: [c_input_padding]RS.Sym = [RS.sym_zero] * c_input_padding;
+        // registers for processing
+        reg r_parity: [2 * RS.t]RS.Sym = [RS.sym_zero] * (2 * RS.t);
+        // status registers
+        reg r_outputting: bool = false;
+        // No parity-only phase needs no counter bits either (singleton range).
+        reg r_output_counter: uint(0..max(1, c_output_cycles)) = 0;
+        // flow control
+        if (!buffered) {
+            r_fc_input_data = input.data;
+            r_fc_input_last = input.last;
+            r_fc_input_valid = input.valid;
+        } else {
+            if (input.valid && !r_fc_input_valid) {
+                r_fc_input_data = input.data;
+                r_fc_input_last = input.last;
+                r_fc_input_valid = input.valid;
+            }
+        }
+        if (output.ready) {
+            r_fc_output_valid = false;
+        }
+        // Advance only when the registered output has room.
+        if (!r_fc_output_valid) {
+            if (!r_outputting) {
+                if (r_fc_input_valid) {
+                    // Internally prepend high-coefficient zeros to the message.
+                    // All arithmetic beats then use the same full-width update.
+                    // External partial beats keep valid symbols in high lanes;
+                    // their lower padding lanes never enter the calculation.
+                    var v_input_data: [unroll]RS.Sym = undef;
+                    if (c_input_padding == 0) {
+                        v_input_data = r_fc_input_data;
+                    } else {
+                        v_input_data[0..c_input_symbols] = r_fc_input_data[c_input_padding..unroll];
+                        v_input_data[c_input_symbols..unroll] = r_input_tail;
+                    }
+                    // update parity
+                    var v_coefs: [unroll]RS.Sym = undef;
+                    for (i in 0..unroll) {
+                        v_coefs[i] = v_input_data[i];
+                        // A beat wider than the remainder sees zero-extended
+                        // state. This condition is evaluated during elaboration.
+                        if (i + 2 * RS.t >= unroll) {
+                            v_coefs[i] = r_parity[2 * RS.t - unroll + i] ^ v_coefs[i];
+                        }
+                    }
+                    if (unroll < 2 * RS.t) {
+                        r_parity[unroll..2 * RS.t] = r_parity[0..2 * RS.t - unroll];
+                        r_parity[0..unroll] = [RS.sym_zero] * unroll;
+                    } else {
+                        r_parity = [RS.sym_zero] * (2 * RS.t);
+                    }
+                    for (j in 0..2 * RS.t) {
+                        var v_reduce = RS.gf_extend(r_parity[j]);
+                        for (i in 0..unroll) {
+                            v_reduce = v_reduce ^ RS.gf_mul_long(c_table[i][j], v_coefs[i]);
+                        }
+                        r_parity[j] = RS.gf_reduce(v_reduce);
+                    }
+                    // Forward this beat into the output register. On the last
+                    // input, replace its padding with newly calculated parity
+                    // and keep the remaining parity for subsequent beats.
+                    r_fc_output_data = r_fc_input_data;
+                    if (r_fc_input_last) {
+                        r_fc_output_data[0..c_input_padding - c_mixed_symbols] = [RS.sym_zero] * (c_input_padding - c_mixed_symbols);
+                        r_fc_output_data[c_input_padding - c_mixed_symbols..c_input_padding] = r_parity[2 * RS.t - c_mixed_symbols..2 * RS.t];
+                        r_parity[c_mixed_symbols..2 * RS.t] = r_parity[0..2 * RS.t - c_mixed_symbols];
+                        r_parity[0..c_mixed_symbols] = [RS.sym_zero] * c_mixed_symbols;
+                        r_input_tail = [RS.sym_zero] * c_input_padding;
+                        r_outputting = c_output_cycles != 0;
+                    } else {
+                        r_input_tail = r_fc_input_data[0..c_input_padding];
+                    }
+                    r_fc_output_last = r_fc_input_last && c_output_cycles == 0;
+                    r_fc_output_valid = true;
+                    r_fc_input_valid = false;
+                }
+            } else if (c_output_cycles != 0) {
+                // output parity data
+                r_fc_output_last = r_output_counter == c_output_cycles - 1;
+                if (r_fc_output_last) {
+                    r_fc_output_data[0..unroll - c_output_symbols] = [RS.sym_zero] * (unroll - c_output_symbols);
+                    r_fc_output_data[unroll - c_output_symbols..unroll] = r_parity[2 * RS.t - c_output_symbols..2 * RS.t];
+                } else {
+                    r_fc_output_data = r_parity[2 * RS.t - unroll..2 * RS.t];
+                }
+                r_fc_output_valid = true;
+                // update output counter
+                if (r_output_counter == c_output_cycles - 1) {
+                    // Clear the whole state, including unused final lanes.
+                    r_parity = [RS.sym_zero] * r_parity.len;
+                    r_outputting = false;
+                    r_output_counter = 0;
+                } else {
+                    // shift parity data
+                    r_parity[unroll..2 * RS.t] = r_parity[0..2 * RS.t - unroll];
+                    r_parity[0..unroll] = [RS.sym_zero] * unroll;
+                    r_output_counter = r_output_counter + 1;
+                }
+            }
+        }
+        // output data from updated register variables
+        if (!buffered) {
+            if (!r_outputting) {
+                r_input_ready_cond = true;
+                r_input_ready_uncond = !r_fc_output_valid;
+            } else {
+                r_input_ready_cond = false;
+                r_input_ready_uncond = false;
+            }
+        } else {
+            r_input_ready_cond = false;
+            r_input_ready_uncond = !r_fc_input_valid;
+        }
+        output.data = r_fc_output_data;
+        output.last = r_fc_output_last;
+        output.valid = r_fc_output_valid;
+    }
+}
+
+fn generate_table(RS: type, unroll: positive) -> [unroll][2 * RS.t]RS.Sym {
+    var v_table: [unroll][2 * RS.t]RS.Sym = [[0] * (2 * RS.t)] * unroll;
+    v_table[0] = RS.generator;
+    for (i in 1..unroll) {
+        val v_coef = v_table[i - 1][2 * RS.t - 1];
+        v_table[i][1..2 * RS.t] = v_table[i - 1][0..2 * RS.t - 1];
+        v_table[i][0] = RS.sym_zero;
+        for (j in 0..2 * RS.t) {
+            v_table[i][j] = v_table[i][j] ^ RS.gf_mul(RS.generator[j], v_coef);
+        }
+    }
+    return v_table;
+}

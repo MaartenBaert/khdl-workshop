@@ -1,0 +1,130 @@
+[[axi-programming-model]]
+== Programming model
+
+The channel primitives, the Manager, and the Subordinate all follow the same
+conventions. This chapter introduces them with the smallest possible example,
+a relay that forwards a channel.
+
+[[axi-channel-contract]]
+=== A first example: a relay
+
+The following is the complete body of a `clocked(clk, sync rst)` block. It
+copies every payload from the `input` channel to the `output` channel:
+
+----
+val rx = receiver(T, ref(input));
+val tx = transmitter(T, ref(output));
+rx.begin();
+tx.begin();
+if (rx.can_pop() && tx.can_push()) {
+    tx.push(rx.pop());
+}
+tx.end();
+rx.end();
+----
+
+The code has three parts:
+
+. *Binding.* The lowercase _binding functions_ `receiver` and `transmitter`
+  attach to an interface port. Each one declares the registers its object needs
+  inside the calling process and returns an _API object_, here of type
+  `Receiver(T)` or `Transmitter(T)`.
+. *Lifecycle.* `begin()` and `end()` bracket each cycle's work.
+. *Work.* Each cycle, the application asks whether operations are possible
+  and performs them conditionally.
+
+The code never mentions VALID or READY and makes no assumption about latency.
+It is correct because each pop requires data and each push requires space.
+Neither latency calculations nor waveform analysis enter that argument.
+
+[[axi-programming-objects]]
+=== API objects hold references, not hardware
+
+An API object is a struct of elaboration-time references to registers and
+interface signals. It is not a hardware pointer. Calling a method expands
+in place to ordinary reads and assignments of those registers in the calling
+process. Binding functions are therefore called inside the clocked process
+that will use the object, and the state they create persists across cycles
+like any other register declared there.
+
+This relies on the local compiler's transparent `ref` struct fields. A field
+declared as `ref slot: T` lets methods read and assign `self.slot` directly,
+and assigning the field updates the register it refers to. Copying an API
+object copies the references, so the copy and the original operate on the same
+state. Binding functions still receive explicit references, such as
+`ref(input)`. `ChannelSignals(T)` groups references to a channel's `data`,
+`valid`, and `ready`, which lets the five AXI channels inside the flat `Axi(C)`
+interface reuse the same channel code. Ordinary interface ports connect
+separate modules. Direct field access is an implementation detail, not
+application API.
+
+[[axi-programming-lifecycle]]
+=== The per-cycle lifecycle
+
+Every cycle, call `begin()` on each object before using it and `end()`
+afterwards. Both calls must be unconditional: never put them inside an
+application `if`. They service the channel even when the application is idle.
+For example, `begin()` notices that an earlier output transferred and frees
+its slot.
+
+Composite objects own their children. A Manager's `begin()` and `end()` handle
+all five AXI channels and every attached endpoint, so call them once on the
+composite and never on its children. A future automatic lifecycle mechanism
+could replace this manual pairing without changing any other operation.
+
+[[axi-programming-operations]]
+=== Availability predicates and operations
+
+Work between `begin()` and `end()` uses a small, FIFO-like vocabulary:
+
+[options="header",cols="1,3"]
+|===
+|Operation |Meaning
+|`can_push()` |Is there room to submit one item now?
+|`push(item)` |Submit one item. Requires `can_push()`.
+|`can_pop()` |Is an item available now?
+|`peek()` |Return the next item without consuming it. Requires `can_pop()`.
+|`pop()` |Consume and return the next item. Requires `can_pop()`.
+|===
+
+Higher-level APIs add variants, such as `can_push_data()` and `push_data(...)`
+for write data, but follow the same pattern. Predicates reflect operations
+already performed earlier in the same cycle. After a push fills the only slot,
+for example, `can_push()` immediately returns false.
+
+Calling an operation without its predicate is a programming error. Runtime
+assertions report it and stop simulation. The implementation guards its state
+updates so that an invalid push does not overwrite pending data, and an empty
+read returns `undef`. These guards do not make invalid calls supported
+behavior: assertions are diagnostics, not flow control.
+
+[[axi-programming-transactions]]
+=== Reason in transactions, not cycles
+
+Correctness must follow from checking predicates, never from knowing how many
+cycles an operation takes. Buffer depths, storage implementations, and loop
+traversal order can change latency and throughput. They do not change which
+transactions happen or their order.
+
+In particular, generic code must not assume that a push makes the item
+available to pop in the same cycle, or that a pop frees space for a push in the
+same cycle. Some storage objects provide this immediate cross-side visibility
+and others deliberately do not (see <<axi-channel-storage-contract>>). The
+tests compare transaction streams across different implementations to check
+that application code does not depend on it.
+
+[[axi-programming-ownership]]
+=== Ownership rules
+
+* Bind each object once, inside the clocked process that owns it.
+* Call `begin()` and `end()` once per cycle on each top-level object, and not on
+  the children of a composite.
+* Do not use copies of an object as independent owners. A copy aliases the
+  same state.
+* References stay inside the module that declares them. Connect modules
+  through ordinary interface ports such as `Axi(C)` or `Channel(T)`.
+* Do not drive an object's implementation fields directly.
+
+Lifecycle checks report a repeated `begin()`, a repeated `end()`, and a
+missing `end()` before the next `begin()`. They cannot enforce progress if a
+process skips the entire lifecycle or drives implementation fields directly.

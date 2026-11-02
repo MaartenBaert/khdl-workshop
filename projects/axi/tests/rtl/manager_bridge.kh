@@ -1,0 +1,55 @@
+// Verification-only wire facade for driving the process-local Manager API from
+// Python. Drivers receive token acknowledgements before consuming completions.
+// Production applications call push() directly and receive their token there.
+import channel.endpoints.[Channel, transmitter, receiver];
+import axi.types.AxiDefault;
+import axi.interfaces.Axi;
+import axi.pooled_manager.[pooled_manager, ReadResult, WriteResult];
+
+struct WriteData(C: type, capacity: positive) {
+    token: uint(0..capacity), data: C.Data, strb: C.Strobe, user: uint(C.wuser_width),
+}
+
+module AxiManagerBridge(C: type = AxiDefault, capacity: positive = 3) ports(
+    clk: in clock, rst: in async bool,
+    sync(clk, async rst) {
+        bus: interface Axi(C).Manager,
+        read_request: interface Channel(C.Ar).Receiver,
+        write_request: interface Channel(C.Aw).Receiver,
+        write_data: interface Channel(WriteData(C, capacity)).Receiver,
+        read_token: interface Channel(uint(0..capacity)).Transmitter,
+        write_token: interface Channel(uint(0..capacity)).Transmitter,
+        read_result: interface Channel(ReadResult(C, capacity)).Transmitter,
+        write_result: interface Channel(WriteResult(C, capacity)).Transmitter,
+    }
+) {
+    clocked(clk, async rst) {
+        val api = pooled_manager(C, ref(bus), capacity);
+        val read_commands = receiver(C.Ar, ref(read_request));
+        val write_commands = receiver(C.Aw, ref(write_request));
+        val data = receiver(WriteData(C, capacity), ref(write_data));
+        val read_tokens = transmitter(uint(0..capacity), ref(read_token));
+        val write_tokens = transmitter(uint(0..capacity), ref(write_token));
+        val read_results = transmitter(ReadResult(C, capacity), ref(read_result));
+        val write_results = transmitter(WriteResult(C, capacity), ref(write_result));
+        api.begin(); read_commands.begin(); write_commands.begin(); data.begin();
+        read_tokens.begin(); write_tokens.begin(); read_results.begin(); write_results.begin();
+        if (read_commands.can_pop() && read_tokens.can_push() && api.read.can_push()) {
+            read_tokens.push(api.read.push(read_commands.pop()));
+        }
+        if (write_commands.can_pop() && write_tokens.can_push() && api.write.can_push()) {
+            write_tokens.push(api.write.push(write_commands.pop()));
+        }
+        if (data.can_pop()) {
+            val beat = data.peek();
+            if (api.write.can_push_data(beat.token)) {
+                val _ = data.pop();
+                val _ = api.write.push_data(beat.token, beat.data, beat.strb, beat.user);
+            }
+        }
+        if (api.read.can_pop() && read_results.can_push()) { read_results.push(api.read.pop()); }
+        if (api.write.can_pop() && write_results.can_push()) { write_results.push(api.write.pop()); }
+        write_results.end(); read_results.end(); write_tokens.end(); read_tokens.end();
+        data.end(); write_commands.end(); read_commands.end(); api.end();
+    }
+}

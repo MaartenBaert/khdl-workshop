@@ -1,0 +1,81 @@
+// All widths describe signed two's-complement integers. Fraction counts only
+// affect the final quantizer: FFA arithmetic is entirely integral.
+pub fn fir_config(
+    input_w: positive = 16, input_f: uint = 15,
+    output_w: positive = 16, output_f: uint = 15,
+    coeff_w: positive = 16, coeff_f: uint = 15,
+    taps: positive = 16, parallel: positive = 4, ffa_depth: uint = 2,
+    taps_per_stage: positive = 4,
+) -> type {
+    assert(2**ffa_depth <= min(taps, parallel), "FFA depth exceeds useful input/tap extent");
+    struct Config {
+        const input_w = input_w; const input_f = input_f;
+        const output_w = output_w; const output_f = output_f;
+        const coeff_w = coeff_w; const coeff_f = coeff_f;
+        const taps = taps; const parallel = parallel; const depth = ffa_depth;
+        const radix = 2**ffa_depth;
+        const phase_stride = gcd(parallel, radix);
+        const phases = radix / phase_stride;
+        const groups = (parallel + radix - phase_stride) +/ radix;
+        const leaves = 3**ffa_depth;
+        const leaf_taps = taps +/ radix;
+        const taps_per_stage = taps_per_stage;
+        const leaf_stages = leaf_taps +/ taps_per_stage;
+        const leaf_first = 1 + ffa_depth;
+        const decode_first = leaf_first + leaf_stages;
+        const round_step = decode_first + ffa_depth;
+        const steps = round_step + 1;
+        const product_bound = 2**(input_w + coeff_w + 2 * ffa_depth - 2);
+        type Input = int(input_w);
+        type Output = int(output_w);
+        type Coeff = int(coeff_w);
+        type EncodedInput = int(input_w + ffa_depth);
+        type EncodedCoeff = int(coeff_w + ffa_depth);
+        type Coefficients = [leaves][leaf_taps]EncodedCoeff;
+        type Phase = uint(0..=radix - phase_stride);
+        type Complete = uint(parallel / radix..=parallel +/ radix);
+    }
+    return Config;
+}
+
+pub struct InputPacket(C: type) { clear: bool, samples: [C.parallel]C.Input }
+pub struct EncodingPacket(C: type, level: uint) {
+    clear: bool, phase: C.Phase, complete: C.Complete,
+    values: [3**level][C.radix * C.groups / 2**level]int(C.input_w + level),
+}
+
+pub fn partial_type(C: type, stages: uint) -> type {
+    var count = 0;
+    if (stages > 0) {
+        count = C.leaf_taps - (C.leaf_stages - stages) * C.taps_per_stage;
+    }
+    val bound = count * C.product_bound;
+    return int(-bound..=bound);
+}
+
+pub struct LeafPacket(C: type, stages: positive) {
+    clear: bool, phase: C.Phase, complete: C.Complete,
+    values: [C.leaves][C.groups]C.EncodedInput,
+    partial: [C.leaves][C.groups]partial_type(C, stages),
+}
+pub struct DecodingPacket(C: type, levels: positive) {
+    clear: bool, phase: C.Phase, complete: C.Complete,
+    values: [C.leaves / 3**levels][C.groups * 2**levels]
+        int(-C.leaf_taps * C.product_bound * 3**levels..=C.leaf_taps * C.product_bound * 3**levels),
+}
+pub struct OutputPacket(C: type) {
+    clear: bool, samples: [C.parallel]C.Output, clipped: bool,
+}
+
+pub fn packet_type(C: type, step: uint) -> type {
+    if (step == 0) { return InputPacket(C); }
+    if (step < C.decode_first) {
+        if (step <= C.leaf_first) { return EncodingPacket(C, step - 1); }
+        return LeafPacket(C, step - C.leaf_first);
+    }
+    if (step <= C.round_step) {
+        if (step == C.decode_first) { return LeafPacket(C, C.leaf_stages); }
+        return DecodingPacket(C, step - C.decode_first);
+    }
+    return OutputPacket(C);
+}

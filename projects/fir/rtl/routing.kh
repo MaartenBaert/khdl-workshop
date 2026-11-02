@@ -1,0 +1,36 @@
+// A window can start at one of `choices` equally spaced sample positions.
+// All source indices and slice endpoints are elaboration constants. The
+// selector controls only connections, never a packed-vector read/write index.
+pub fn select_window(width: uint, choices: positive, stride: positive,
+    selection: uint(0..choices), values: any) -> any {
+    assert(2**clog2(choices) == choices, "Window choices must be a power of two");
+    assert(values.len >= width + (choices - 1) * stride, "Window input is too short");
+    if (choices == 1) { return values[0..width]; }
+    else {
+        // Select the high offset bit first, then progressively narrower
+        // windows. This is a logarithmic barrel network with fixed wiring.
+        const half = choices / 2;
+        const inner_width = width + (half - 1) * stride;
+        var window = values[0..inner_width];
+        if (selection >= half) {
+            window = values[half * stride..half * stride + inner_width];
+        }
+        return select_window(width, half, stride, selection % half, window);
+    }
+}
+
+// Comparison implementation for the routing experiment. Its complete set of
+// possible connections is explicit, but the running result can form a priority
+// mux chain. Synthesis decides how far it can restructure that chain.
+pub fn enumerate_window(width: uint, choices: positive, stride: positive,
+    selection: uint(0..choices), values: any) -> any {
+    assert(2**clog2(choices) == choices, "Window choices must be a power of two");
+    assert(values.len >= width + (choices - 1) * stride, "Window input is too short");
+    var result = values[0..width];
+    for (choice in 1..choices) {
+        if (selection == choice) {
+            result = values[choice * stride..choice * stride + width];
+        }
+    }
+    return result;
+}

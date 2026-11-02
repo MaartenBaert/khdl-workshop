@@ -1,0 +1,76 @@
+// Combinational round-robin selection: a linear two-pass scan and two balanced
+// trees with the same result. See references/synthesis.md for integration.
+// Callers update last only when the selected request is actually accepted.
+pub struct Selection(count: positive) { found: bool, index: uint(0..count) }
+
+pub fn round_robin_linear(count: positive, request: [count]bool,
+    last: uint(0..count)) -> Selection(count) {
+    var result = Selection(count).new(found=false, index=0);
+    for (pass in 0..2) {
+        for (i in 0..count) {
+            if (pass == 1 || i > last) {
+                if (!result.found && request[i]) {
+                    result = Selection(count).new(found=true, index=i);
+                }
+            }
+        }
+    }
+    return result;
+}
+
+// Both child calls use static, strictly smaller intervals. Evaluate them before
+// choosing a result, so each level merges two independently computed subtrees.
+fn first_request(count: positive, request: [count]bool,
+    lo: uint, hi: uint) -> Selection(count) {
+    const { assert(lo < hi && hi <= count); }
+    if (hi - lo == 1) {
+        return Selection(count).new(found=request[lo], index=lo);
+    } else {
+        val middle = (lo + hi) / 2;
+        val left = first_request(count, request, lo, middle);
+        val right = first_request(count, request, middle, hi);
+        var result = right;
+        if (left.found) { result = left; }
+        return result;
+    }
+}
+
+pub fn round_robin_tree(count: positive, request: [count]bool,
+    last: uint(0..count)) -> Selection(count) {
+    var masked = [false] * count;
+    for (i in 0..count) { masked[i] = request[i] && i > last; }
+    val after = first_request(count, masked, 0, count);
+    val anywhere = first_request(count, request, 0, count);
+    var result = anywhere;
+    if (after.found) { result = after; }
+    return result;
+}
+
+// The extra bit ranks an after-last candidate above any wraparound candidate.
+// after implies found. Keep the public result identical for both tree variants.
+struct TaggedSelection(count: positive) {
+    found: bool, after: bool, index: uint(0..count),
+}
+
+fn rotated_request(count: positive, request: [count]bool, last: uint(0..count),
+    lo: uint, hi: uint) -> TaggedSelection(count) {
+    const { assert(lo < hi && hi <= count); }
+    if (hi - lo == 1) {
+        return TaggedSelection(count).new(found=request[lo],
+            after=request[lo] && lo > last, index=lo);
+    } else {
+        val middle = (lo + hi) / 2;
+        val left = rotated_request(count, request, last, lo, middle);
+        val right = rotated_request(count, request, last, middle, hi);
+        var index = right.index;
+        if (left.after || (left.found && !right.after)) { index = left.index; }
+        return TaggedSelection(count).new(found=left.found || right.found,
+            after=left.after || right.after, index=index);
+    }
+}
+
+pub fn round_robin_single_tree(count: positive, request: [count]bool,
+    last: uint(0..count)) -> Selection(count) {
+    val result = rotated_request(count, request, last, 0, count);
+    return Selection(count).new(found=result.found, index=result.index);
+}

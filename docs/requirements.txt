@@ -1,0 +1,2 @@
+asciidoc==10.2.1
+wavedrom==2.0.3.post3

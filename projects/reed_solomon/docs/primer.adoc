@@ -1,0 +1,96 @@
+[[reed-solomon-primer]]
+== Reed–Solomon essentials
+
+This chapter introduces the concepts and names that the rest of the manual
+uses. It is not a derivation of the algorithms; the stage descriptions in
+<<reed-solomon-stages>> say what each one computes.
+
+[[reed-solomon-primer-code]]
+=== Symbols, codewords, and correction capability
+
+A Reed–Solomon code works on *symbols* of `m` bits rather than on single bits.
+An RS(n,k) code turns `k` message symbols into an `n`-symbol *codeword* by
+appending `R=n-k` parity symbols. Because the message symbols appear
+unchanged in the codeword, the code is *systematic*.
+
+The decoder can correct up to `t=R/2` symbol errors per codeword, at unknown
+positions. A symbol counts as one error however many of its bits are wrong,
+which makes Reed–Solomon codes good at burst errors. The default RS(240,224)
+code has 16 parity symbols and corrects up to 8 erroneous bytes per codeword.
+
+`n` can be at most `2**m-1`, which is 255 for 8-bit symbols. A smaller `n`
+gives a *shortened* code: conceptually the missing high message symbols are
+zero, and they are never transmitted.
+
+[[reed-solomon-primer-field]]
+=== Field arithmetic
+
+Symbols are elements of the finite field GF(`2**m`). Addition and
+subtraction are both bitwise XOR. Multiplication treats each symbol as a
+polynomial over bits and reduces products modulo a fixed *reduction
+polynomial* `prim` of degree `m`, for example `0x11d` for 8-bit symbols. A
+generator element `alpha` produces every nonzero field element as a power
+`alpha**i`. The
+configuration computes power and inverse tables from these parameters during
+elaboration; see <<reed-solomon-configuration>>.
+
+[[reed-solomon-primer-polynomials]]
+=== Codewords as polynomials
+
+A frame of symbols is treated as the coefficients of a polynomial: symbol
+`a[j]` is the coefficient of `x**j`. The message occupies the highest
+coefficients and the parity the lowest. Streams send the highest coefficient
+first, so the message symbols arrive before the parity.
+
+The code is defined by its *generator polynomial*
+`g(x)=product(x + alpha**(fcr+i), i=0..R-1)`, whose roots are `R`
+consecutive powers of `alpha`. `fcr`, the first consecutive root, is a
+convention that differs between standards; this design supports 0 and 1. The
+encoder chooses the parity so that every codeword polynomial is divisible by
+`g(x)`, which is equivalent to it being zero at all `R` roots.
+
+[[reed-solomon-primer-decoding]]
+=== Decoding in five steps
+
+A received codeword is the transmitted codeword plus an error polynomial
+whose nonzero coefficients are the error values at the error positions.
+`RsDecoder` finds those positions and values in five pipelined stages:
+
+[options="header",cols="1,4"]
+|===
+|Stage |What it computes
+|`RsSyndromes`
+|Evaluates the received polynomial at the `R` roots of `g(x)`. These
+ *syndromes* are all zero exactly when the received word is a valid codeword.
+|`RsBerlekamp`
+|Runs the Berlekamp–Massey algorithm on the syndromes to find the
+ *error-locator polynomial*. Its roots identify the error positions, and its
+ degree is the number of errors it assumes.
+|`RsChien`
+|Performs a *Chien search*: evaluates the locator at every position to find its
+ roots. It also computes the *error-evaluator polynomial* that the next step
+ needs.
+|`RsForney`
+|Applies Forney's formula to compute the *error value* at each position from
+ the evaluator and the locator's derivative.
+|`RsCorrection`
+|XORs the error values into the affected message symbols and streams the
+ corrected message out.
+|===
+
+[[reed-solomon-primer-outcomes]]
+=== What the decoder can and cannot detect
+
+* With at most `t` errors, the decoder corrects the codeword. `num_errors`
+  reports how many symbols were wrong, including parity symbols, which are
+  not part of the output.
+* With more than `t` errors, two outcomes are possible. If the number of
+  locator roots found differs from the locator's degree, or Forney's formula
+  meets a zero denominator, the decoder reports `failed` and passes the
+  received message through unchanged. Otherwise the received word lies
+  within `t` symbols of a _different_ valid codeword, and the decoder
+  "corrects" it to the wrong message without any indication.
+
+Use an outer integrity check, such as a CRC, when undetected miscorrection
+matters. This decoder corrects errors at unknown positions only; it does not
+accept erasures, which are errors at known positions.

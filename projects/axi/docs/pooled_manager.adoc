@@ -1,0 +1,40 @@
+[[axi4-pooled-manager]]
+== Forwarding transactions: the pooled Manager
+
+Source: `rtl/axi/pooled_manager.kh`.
+
+The fixed-ID Manager (<<axi4-manager>>) suits components that originate their
+own traffic. A forwarding component, such as a router, must instead preserve
+the IDs chosen by its upstream Manager, which are not known at elaboration.
+`pooled_manager(C, ref(bus), capacity=2)` provides this. It retains the
+library's earlier Manager API and is used by `AxiRouter` (<<axi4-router>>).
+
+The pooled Manager exposes fields `api.read` and `api.write` rather than
+endpoints. Each side owns one shared pool of `capacity` contexts and works
+with tokens, like the Subordinate (<<axi4-tokens>>):
+
+[options="header",cols="1,2,3"]
+|===
+|Side |Operation |Contract
+|Both |`can_push()`, `push(request) -> token` |Validate and send the request with its own ID. Requires a free context and a free output slot.
+|Both |`can_push_ordered(id)` |`can_push()`, and every live context of this side has this ID.
+|Write |`can_push_data(token)`, `push_data(token, data, strb, user=0) -> bool` |Send the next W beat for `token`, which must be the oldest write that still needs data. Return whether it is final.
+|Both |`can_pop()`, `peek()`, `pop()` |Return a token-bearing `ReadResult` or `WriteResult` for the next received response.
+|===
+
+A response matches the oldest unfinished context with its ID. Results of
+different IDs may therefore reorder or, for reads, interleave. The token in
+each result identifies the transaction it belongs to. Peeking a B response is
+an assertion error if its burst's data is incomplete, or if its final W beat is
+still waiting in the W output register.
+
+`can_push_ordered(id)` restricts admission to the current ID: a new ID is
+admitted only after all contexts of the previous ID have drained. The router
+uses this policy so that each destination returns responses in request order,
+which avoids buffering whole out-of-order bursts. Same-ID pipelining remains
+possible.
+
+Completed contexts are reclaimed in allocation order, so an unfinished older
+context can block reuse of later completed contexts. Read and write sides use
+separate pools of `capacity` contexts each. These restrictions belong to this
+implementation, not to the fixed-ID endpoint Manager.

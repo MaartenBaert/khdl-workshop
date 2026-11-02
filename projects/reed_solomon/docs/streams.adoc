@@ -1,0 +1,177 @@
+[[reed-solomon-streams]]
+== Streams and handshakes
+
+`RsEncoder` and `RsDecoder` exchange data through symbol streams. This chapter
+defines their clock and reset behavior, the handshake, how frames are framed
+and ordered on the stream, and the optional input buffering. The decoder's
+internal stages use the same rules; their block interfaces are described in
+<<reed-solomon-stages>>.
+
+[[reed-solomon-interfaces]]
+=== Clock, reset, and transfers
+
+All stateful modules have `clk: in clock` and `rst: in bool`, with their
+interfaces in `sync(clk)`. Reset is active high and synchronous. Assert it
+across a rising edge before first use. A reset edge discards all in-flight
+work and clears output `valid`; no transfer happens on that edge. Payload
+values are unspecified while `valid=0`, including across reset. Do not depend
+on them holding their old values or becoming zero.
+
+A beat transfers on a rising edge where `rst=0`, `valid=1`, and `ready=1`. The
+source drives the payload and `valid`; the sink drives `ready`. A source must
+assert `valid` without waiting for `ready`, and must hold `valid` and the
+entire payload stable until the transfer. A new beat may follow on the next
+clock edge without a gap.
+
+In all timing diagrams, column `i` shows the values sampled at rising edge
+`i`, and a register updated by that edge is visible in the following column.
+`transfer` rows are explanatory, not RTL signals. An `x` means the payload is
+irrelevant because `valid=0`.
+
+.The second beat waits for ready; last is part of the held payload.
+[wavedrom]
+....
+{"signal":[
+  {"name":"clk","wave":"p......"},
+  {"name":"valid","wave":"01...0."},
+  {"name":"ready","wave":"1.0.1.."},
+  {"name":"data","wave":"x23..x.","data":["beat A","beat B"]},
+  {"name":"last","wave":"0.1..0."},
+  {"name":"transfer","wave":"010.10."}
+],"head":{"text":"Ready/valid stall","tick":0},"config":{"hscale":2}}
+....
+
+.Reset at edge two cancels the pending output; ready high on that reset edge does not transfer it.
+[wavedrom]
+....
+{"signal":[
+  {"name":"clk","wave":"p....."},
+  {"name":"rst","wave":"0.10.."},
+  {"name":"output.valid","wave":"1..0.."},
+  {"name":"output.ready","wave":"0.1..."},
+  {"name":"output.data","wave":"2..x..","data":["pending beat"]},
+  {"name":"transfer","wave":"0....."}
+],"head":{"text":"Synchronous reset discards pending work","tick":0},"config":{"hscale":2}}
+....
+
+[[reed-solomon-stream]]
+=== The RsStream interface
+
+`RsStream(unroll, decoded=false, RS=RsDefault)` is defined in
+`rtl/reedsolo_interfaces.kh`. `unroll` is the positive number of symbol lanes
+per beat, and `RS` is the code configuration. The `decoded` variant, produced
+by `RsDecoder`, adds per-frame status.
+
+[cols="1,1,3",options="header"]
+|===
+|Field |Direction from Source |Meaning
+|data |out |Array of `unroll` symbols, each `RS.m` bits.
+|last |out |This is the frame's final beat.
+|valid |out |The payload is available.
+|ready |in |The sink can accept the beat at this edge.
+|num_errors |out |Decoded only: number of erroneous symbols found, in `0..=RS.t`.
+|failed |out |Decoded only: the decoder detected an uncorrectable frame.
+|===
+
+The `Sink` view reverses every direction. `num_errors` and `failed` repeat
+unchanged on every beat of a decoded frame and are held during stalls, like
+the rest of the payload.
+
+A frame is a fixed number of symbols, set by the configuration:
+
+[options="header",cols="2,1,1"]
+|===
+|Stream |Symbols per frame |Beats per frame
+|`RsEncoder` input, `RsDecoder` output (messages) |`k` |`K=(k +/ U)`
+|`RsEncoder` output, `RsDecoder` input (codewords) |`n` |`C=(n +/ U)`
+|===
+
+Here `U` is the stream width and `+/` is ceiling division. The first accepted
+beat after a `last` starts the next frame. There is no keep mask, symbol
+count, start marker, frame identifier, or per-frame configuration: the
+configuration and the beat index determine which lanes are valid. A codeword
+packs message and parity symbols together, so the beat that holds the last
+message symbols can also hold the first parity symbols.
+
+[[reed-solomon-ordering]]
+=== Symbol order and padding
+
+Frames are polynomials whose arrays are low coefficient first: `a[j]` is the
+coefficient of `x**j` (see <<reed-solomon-primer-polynomials>>). On a stream:
+
+* Beats carry the highest coefficients first.
+* *Within each beat, lane indices increase with coefficient degree.* The
+  equivalent serial order therefore visits a beat from its highest lane to its
+  lowest, then moves on to the next beat.
+* When the frame length is not a multiple of `U`, the final beat is padded.
+  *Padding occupies the low-index lanes; valid symbols occupy the high-index
+  lanes.*
+
+In the arrays below, square brackets list lanes from lane zero on the left to
+lane `U-1` on the right; they are not a serial symbol listing. For RS(13,7)
+with `U=4`, let `d0` be the lowest message coefficient and `p0` the lowest
+parity coefficient. The systematic codeword array is `[p0..p5, d0..d6]`, and
+the stream beats are:
+
+[cols="1,2,2,2",options="header"]
+|===
+|Beat |Message (`RsEncoder` input, `RsDecoder` output) |Codeword (`RsEncoder` output, `RsDecoder` input) |Codeword last
+|0 |`[d3 d4 d5 d6]` |`[d3 d4 d5 d6]` |0
+|1 |`[0 d0 d1 d2]` |`[p5 d0 d1 d2]` |0
+|2 |— |`[p1 p2 p3 p4]` |0
+|3 |— |`[0 0 0 p0]` |1
+|===
+
+.Four codeword beats, with one mixed message/parity beat and a padded final beat.
+[wavedrom]
+....
+{"signal":[
+  {"name":"clk","wave":"p....."},
+  {"name":"valid","wave":"01...0"},
+  {"name":"ready","wave":"1....."},
+  {"name":"lane 0","wave":"x2345x","data":["d3","p5","p1","0"]},
+  {"name":"lane 1","wave":"x2345x","data":["d4","d0","p2","0"]},
+  {"name":"lane 2","wave":"x2345x","data":["d5","d1","p3","0"]},
+  {"name":"lane 3","wave":"x2345x","data":["d6","d2","p4","p0"]},
+  {"name":"last","wave":"0...10"}
+],"head":{"text":"RS(13,7), four lanes, codeword stream","tick":0},"config":{"hscale":2}}
+....
+
+In general, for a frame of `L` symbols, define `B=(L +/ U)` and `P=B*U-L`.
+There are exactly `B` beats, with `last` only on beat `B-1`. On beat `b`,
+lane `l` carries coefficient `j=(B-1-b)*U + l - P` when `j >= 0`. Negative
+`j` occurs only in the final beat and denotes padding.
+
+Padding is transport overhead, not additional symbols. Sources should drive
+it to zero. The `RsEncoder` and `RsDecoder` inputs ignore padding lanes even
+when they contain nonzero values, and their outputs always drive padding to
+zero.
+
+[[reed-solomon-flow-control]]
+=== Optional input buffering
+
+`RsEncoder` and `RsDecoder` take `buffered: bool = false`, which selects how
+their input `ready` behaves:
+
+* With `buffered=false`, downstream `ready` can affect input `ready`
+  combinationally in the same cycle.
+* With `buffered=true`, a one-beat input holding register cuts that
+  combinational path.
+
+An empty holding register can accept and process a beat at the same edge, so
+buffering adds no cycle to the latency of an idle module. An occupied holding
+register cannot be refilled at the edge where it drains, so brief input
+bubbles are possible while recovering from backpressure. `RsDecoder` applies
+the flag only to its input stage, `RsSyndromes`; it does not add buffers
+between the other stages, which already hold their results under backpressure
+(see <<reed-solomon-stages>>).
+
+[[reed-solomon-ports]]
+=== Exported port names
+
+KHDL flattens interface fields into Verilog ports with underscores:
+`input.data` becomes `input_data`, `output.valid` becomes `output_valid`, and
+decoded streams also have `output_num_errors` and `output_failed`. `data` is a
+packed array of `unroll` symbols, lane zero in the least significant bits.
+Python simulations keep the interface hierarchy, for example
+`inst.ports.output.valid`, with type metadata in `inst.info_ports`.

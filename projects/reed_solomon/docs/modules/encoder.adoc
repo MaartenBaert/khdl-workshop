@@ -1,0 +1,128 @@
+[[reed-solomon-encoder]]
+== RsEncoder
+
+Source: `rtl/reedsolo_encoder.kh`.
+
+=== Function and interfaces
+
+`RsEncoder` forwards each message unchanged and appends its `R=n-k` parity
+symbols. Internally it keeps the running parity remainder, updating it once
+per input beat with a full-width unrolled network. The generator and
+multiplication tables follow `RS`; see <<reed-solomon-rs-config>> for the
+codeword polynomial.
+
+`input` is an `RsStream(U, decoded=false, RS=RS).Sink` carrying `k` message symbols per frame;
+`output` is an `RsStream(U, decoded=false, RS=RS).Source` carrying `n` codeword symbols per
+frame. Both follow <<reed-solomon-ordering>>. Exactly `K=(k +/ U)` input beats
+must be accepted per frame, with `last` on the final beat only; the encoder
+does not check this. The output has `C=(n +/ U)` beats and asserts `last` on
+its final beat.
+
+[cols="1,1,3",options="header"]
+|===
+|Parameter |Default |Effect / constraint
+|RS |RsDefault |Code and arithmetic configuration.
+|unroll |1 |Any positive `U`; symbol lanes on both streams.
+|buffered |false |Optional one-beat input holding storage; see <<reed-solomon-flow-control>>.
+|===
+
+=== Unaligned messages and timing
+
+From an empty `RsEncoder`, the first output beat can transfer one cycle after
+the first input beat transfers, assuming output readiness. This applies to
+aligned and unaligned messages in both buffering modes. Every processed
+input beat loads its corresponding output beat into the output register on
+the same edge.
+
+For the RS(13,7), `U=4` example, the two arithmetic input beats, written
+low lane first, are `[d4 d5 d6 0]` and `[d0 d1 d2 d3]`. The high-degree
+zero is harmless to the parity computation. A one-symbol tail register
+holds `d3` between these updates. More generally, the tail holds only
+`U-(k % U)` symbols for unaligned messages; aligned messages need none.
+The tail is cleared on the last input beat for the following frame.
+
+The external message beats retain their original ordering. On the final
+input beat, the mixed output `[p5 d0 d1 d2]` replaces the input's low padding
+lanes with newly calculated parity. `RsEncoder` then shifts those emitted
+parity symbols out of the remainder. All output payload and control signals
+are registered. The logic feeding the mixed-beat output register includes
+the final parity update and output selection, sharing the existing arithmetic
+network.
+
+With the first input accepted at edge zero and the second at edge one,
+the register updates and transfers are:
+
+[cols="1,3,3",options="header"]
+|===
+|Edge |Internal work / output register load |Output transfer
+|0 |Compute first parity update; load first raw beat into output. |None
+|1 |Compute final parity update; load mixed beat into output. |First raw beat
+|2 |Load first parity-only beat. |Mixed beat
+|3 |Load final padded parity beat. |First parity-only beat
+|===
+
+.An empty RsEncoder with both input beats immediately available and output ready throughout.
+[wavedrom]
+....
+{"signal":[
+  {"name":"clk","wave":"p....."},
+  {"name":"input.valid","wave":"1.0..."},
+  {"name":"input.ready","wave":"1.0.1."},
+  {"name":"input.data","wave":"23x...","data":["d3..d6","0,d0..d2"]},
+  {"name":"input.last","wave":"010..."},
+  {"name":"output.valid","wave":"01...0"},
+  {"name":"output.ready","wave":"1....."},
+  {"name":"output.data","wave":"x2345x","data":["d3..d6","p5,d0..d2","p1..p4","0,0,0,p0"]},
+  {"name":"output.last","wave":"0...10"}
+],"head":{"text":"RsEncoder: RS(13,7), U=4, buffered=false","tick":0},"config":{"hscale":3}}
+....
+
+After output starts, a continuously supplied frame can produce one output
+beat each cycle, including across the mixed message/parity beat. Forwarding
+an input beat does not wait for the following beat. Parity-only beats require
+no further input. Backpressure holds the output stable and prevents further
+parity/state advances until the output register has room.
+
+For an isolated continuously supplied frame, first input at edge zero gives
+last output transfer at edge `C`. `buffered` does not change that
+empty-pipeline example. Minimal mode stops accepting message input during
+parity emission; buffered mode can hold one beat of the following frame.
+It is not a full-codeword FIFO. With continuous input and output readiness,
+the sustained interval is C cycles/frame. See <<reed-solomon-performance>> for the
+common timing definitions and optional width-selection helper.
+
+=== Beats wider than the parity remainder
+
+Any positive `U` is supported, including widths exceeding `R`, `n`, or the
+field period. The arithmetic update zero-extends the old remainder before
+combining it with the input. Compile-time guards select the valid old-state
+coefficients, and the same table construction handles the wider update.
+There is no additional arithmetic network or runtime width comparison.
+
+The final input beat emits `min(U-(k % U), R)` parity symbols for unaligned
+messages. If all parity fits there, that beat also asserts `last`, and no
+parity-only phase follows. Any lower unused lanes are zero. For RS(7,1),
+`U=8`, the entire frame is:
+
+----
+input:  [0 0  0  0  0  0  0 d0]
+output: [0 p0 p1 p2 p3 p4 p5 d0]  last=1
+----
+
+.A whole codeword fits in one registered output beat, including its low-lane padding.
+[wavedrom]
+....
+{"signal":[
+  {"name":"clk","wave":"p.."},
+  {"name":"input.valid","wave":"10."},
+  {"name":"input.ready","wave":"1.."},
+  {"name":"input.data","wave":"2x.","data":["0,0,0,0,0,0,0,d0"]},
+  {"name":"input.last","wave":"10."},
+  {"name":"output.valid","wave":"010"},
+  {"name":"output.ready","wave":"1.."},
+  {"name":"output.data","wave":"x2x","data":["0,p0,p1,p2,p3,p4,p5,d0"]},
+  {"name":"output.last","wave":"010"}
+],"head":{"text":"RsEncoder: RS(7,1), U=8, buffered=false","tick":0},"config":{"hscale":5}}
+....
+
+There is no requirement that `U` divide `k`, `n`, or `R`.

@@ -1,0 +1,191 @@
+import channel.endpoints.[Channel, transmitter, receiver];
+import channel.buffers.[internal, fifo, storage];
+
+struct Packet { tag: uint(0..5), words: [2]uint(8), last: bool }
+
+// Transaction-level code: the endpoint types need only supply these FIFO
+// operations. Neither payload timing nor cross-side same-cycle effects enter
+// the correctness argument: pop and push occur only when both are permitted.
+fn forward(input: any, output: any) {
+    if (input.can_pop() && output.can_push()) { output.push(input.pop()); }
+}
+
+module Relay(T: type, stages: uint = 0, reverse: bool = false, depth: positive = 1) ports(
+    clk: in clock,
+    sync(clk) {
+        rst: in bool,
+        input: interface Channel(T).Receiver,
+        output: interface Channel(T).Transmitter,
+    }
+) {
+    clocked(clk, sync rst) {
+        val rx = receiver(T, ref(input));
+        val tx = transmitter(T, ref(output));
+        val queues = [storage(T, depth) for i in 0..stages];
+        rx.begin();
+        tx.begin();
+        for (i in 0..stages) { queues[i].begin(); }
+
+        if (stages == 0) {
+            forward(rx, tx);
+        } else {
+            // Both traversal orders use exactly the same transaction logic.
+            for (step in 0..stages + 1) {
+                var i = step;
+                if (reverse) { i = stages - step; }
+                if (i == 0) {
+                    forward(rx, queues[0]);
+                } else if (i == stages) {
+                    forward(queues[stages - 1], tx);
+                } else { forward(queues[i - 1], queues[i]); }
+            }
+        }
+
+        for (i in 0..stages) { queues[i].end(); }
+        tx.end();
+        rx.end();
+    }
+}
+
+module Independent ports(
+    clk: in clock,
+    sync(clk) {
+        rst: in bool,
+        input_a: interface Channel(uint(8)).Receiver,
+        output_a: interface Channel(uint(8)).Transmitter,
+        input_b: interface Channel(uint(8)).Receiver,
+        output_b: interface Channel(uint(8)).Transmitter,
+    }
+) {
+    clocked(clk, sync rst) {
+        val rx_a = receiver(uint(8), ref(input_a));
+        val tx_a = transmitter(uint(8), ref(output_a));
+        val rx_b = receiver(uint(8), ref(input_b));
+        val tx_b = transmitter(uint(8), ref(output_b));
+        rx_a.begin(); tx_a.begin(); rx_b.begin(); tx_b.begin();
+        forward(rx_a, tx_a);
+        forward(rx_b, tx_b);
+        rx_a.end(); tx_a.end(); rx_b.end(); tx_b.end();
+    }
+}
+
+module Chain(T: type) ports(
+    clk: in clock,
+    sync(clk) {
+        rst: in bool,
+        input: interface Channel(T).Receiver,
+        output: interface Channel(T).Transmitter,
+    }
+) {
+    wire middle: interface Channel(T);
+    instance Relay(T) ports(clk, rst, input, output=middle);
+    instance Relay(T) ports(clk, rst, input=middle, output);
+}
+
+// Method-level observations stay in verification examples, not application
+// code. They distinguish immediate same-side effects from cross-side promises.
+module FifoProbe(depth: int(2..) = 2) ports(
+    clk: in clock,
+    sync(clk) {
+        rst: in bool, push: in bool, pop: in bool, value: in uint(8),
+        before_push: out bool, before_pop: out bool,
+        after_push: out bool, after_pop: out bool,
+        peeked: out uint(8), popped: out uint(8),
+    }
+) {
+    clocked(clk, sync rst) {
+        val queue = fifo(uint(8), depth);
+        reg wire before_push = false; reg wire before_pop = false;
+        reg wire after_push = false; reg wire after_pop = false;
+        reg wire peeked = undef; reg wire popped = undef;
+        queue.begin();
+        before_push = queue.can_push(); before_pop = queue.can_pop();
+        if (push) { queue.push(value); }
+        if (queue.can_pop()) { peeked = queue.peek(); }
+        if (pop) { popped = queue.pop(); }
+        after_push = queue.can_push(); after_pop = queue.can_pop();
+        queue.end();
+    }
+}
+
+module InternalProbe(reverse: bool = false) ports(
+    clk: in clock,
+    sync(clk) {
+        rst: in bool, push: in bool, pop: in bool, value: in uint(8),
+        before_push: out bool, before_pop: out bool,
+        after_push: out bool, after_pop: out bool,
+        peeked: out uint(8), popped: out uint(8),
+    }
+) {
+    clocked(clk, sync rst) {
+        val queue = internal(uint(8));
+        reg wire before_push = false; reg wire before_pop = false;
+        reg wire after_push = false; reg wire after_pop = false;
+        reg wire peeked = undef; reg wire popped = undef;
+        queue.begin();
+        before_push = queue.can_push(); before_pop = queue.can_pop();
+        if (reverse) {
+            if (queue.can_pop()) { peeked = queue.peek(); }
+            if (pop) { popped = queue.pop(); }
+            if (push) { queue.push(value); }
+        } else {
+            if (push) { queue.push(value); }
+            if (queue.can_pop()) { peeked = queue.peek(); }
+            if (pop) { popped = queue.pop(); }
+        }
+        after_push = queue.can_push(); after_pop = queue.can_pop();
+        queue.end();
+    }
+}
+
+module ReceiverProbe ports(
+    clk: in clock,
+    sync(clk) {
+        rst: in bool, pop: in bool,
+        input: interface Channel(uint(8)).Receiver,
+        available: out bool, after_pop: out bool, peeked: out uint(8), popped: out uint(8),
+    }
+) {
+    clocked(clk, sync rst) {
+        val rx = receiver(uint(8), ref(input));
+        reg wire available = false; reg wire after_pop = false;
+        reg wire peeked = undef; reg wire popped = undef;
+        rx.begin();
+        available = rx.can_pop();
+        if (rx.can_pop()) { peeked = rx.peek(); }
+        if (pop) { popped = rx.pop(); }
+        after_pop = rx.can_pop();
+        rx.end();
+    }
+}
+
+module TransmitterProbe ports(
+    clk: in clock,
+    sync(clk) {
+        rst: in bool, push: in bool, value: in uint(8),
+        output: interface Channel(uint(8)).Transmitter,
+        available: out bool, after_push: out bool,
+    }
+) {
+    clocked(clk, sync rst) {
+        val tx = transmitter(uint(8), ref(output));
+        reg wire available = false; reg wire after_push = false;
+        tx.begin();
+        available = tx.can_push();
+        if (push) { tx.push(value); }
+        after_push = tx.can_push();
+        tx.end();
+    }
+}
+
+fn check_examples() {
+    for (T in [bool, uint(8), [3]uint(4), Packet, uint(0..1)]) {
+        Relay(T);
+        Relay(T, stages=2);
+        Relay(T, stages=2, reverse=false, depth=2);
+    }
+    for (reverse in [false, true]) { Relay(Packet, stages=3, reverse=reverse, depth=3); }
+    Relay(Packet, stages=3, reverse=true);
+    Independent; Chain(Packet); InternalProbe(); InternalProbe(reverse=true); FifoProbe(); ReceiverProbe; TransmitterProbe;
+}
+const { check_examples(); }

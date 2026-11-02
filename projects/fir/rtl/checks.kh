@@ -1,0 +1,14 @@
+// Concrete all-items/LSP roots. Python's lazy API calls this function explicitly.
+import fir.Fir;
+
+pub fn check_examples() {
+    Fir();
+    Fir(4, 0, 6, 0, 4, 0, 1, 1, 0, 1);
+    Fir(8, 3, 10, 3, 7, 2, 9, 7, 2, 2);
+    Fir(8, 3, 10, 3, 7, 2, 9, 7, 2, 2, (8,));
+    Fir(8, 3, 10, 3, 7, 2, 9, 7, 2, 2, (3, 2, 3));
+    Fir(8, 3, 10, 3, 7, 2, 6, 6, 2, 2);
+    Fir(8, 3, 10, 3, 7, 2, 3, 7, 1, 4);
+    Fir(12, 5, 18, 8, 10, 6, 35, 17, 4, 3);
+}
+const { check_examples(); }

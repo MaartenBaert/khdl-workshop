@@ -1,0 +1,91 @@
+import axi.types.[AxiDefault, read_request, write_request];
+import axi.interfaces.Axi;
+import axi.manager.[manager, read_endpoint, write_endpoint];
+import channel.endpoints.[Channel, transmitter, receiver];
+
+pub struct CopyCommand(C: type) { source: C.Addr, destination: C.Addr, bytes: uint(0..=2**C.addr_width), tag: uint(8) }
+pub struct CopyResult { tag: uint(8), resp: uint(2) }
+
+// Aligned, non-overlapping memory copies. The application selects burst chunks
+// and forwards transactions; the Manager API owns every AXI handshake and LAST.
+// Read errors suppress strobes for the affected beat; errors can leave a partial
+// copy, but all issued bus obligations are drained before returning a result.
+pub module AxiCopy(C: type = AxiDefault) ports(
+    clk: in clock, rst: in async bool,
+    sync(clk, async rst) {
+        bus: interface Axi(C).Manager,
+        command: interface Channel(CopyCommand(C)).Receiver,
+        result: interface Channel(CopyResult).Transmitter,
+    }
+) {
+    clocked(clk, async rst) {
+        val read = read_endpoint(C);
+        val write = write_endpoint(C);
+        val api = manager(C, ref(bus), reads=(read,), writes=(write,));
+        val commands = receiver(CopyCommand(C), ref(command));
+        val results = transmitter(CopyResult, ref(result));
+        reg r_active = false;
+        reg r_burst_active = false;
+        reg r_source: C.Addr = undef;
+        reg r_destination: C.Addr = undef;
+        reg r_remaining: uint(0..=2**C.addr_width) = undef;
+        reg r_chunk_bytes: uint(0..32769) = undef;
+        reg r_tag: uint(8) = undef;
+        reg r_resp: uint(2) = 0;
+        api.begin(); commands.begin(); results.begin();
+        if (!r_active && commands.can_pop()) {
+            val request = commands.pop();
+            val valid = (request.source & (C.bytes - 1)) == 0
+                && (request.destination & (C.bytes - 1)) == 0
+                && (request.bytes & (C.bytes - 1)) == 0
+                && request.source + request.bytes <= 2**C.addr_width
+                && request.destination + request.bytes <= 2**C.addr_width
+                && (request.bytes == 0 || request.source + request.bytes <= request.destination
+                    || request.destination + request.bytes <= request.source);
+            assert(valid, "AxiCopy: aligned non-overlapping in-range command required");
+            if (valid) {
+                r_source = request.source; r_destination = request.destination;
+                r_remaining = request.bytes; r_tag = request.tag; r_resp = C.okay;
+                r_active = true;
+            }
+        }
+        if (r_active && !r_burst_active && r_remaining > 0 && read.can_push() && write.can_push()) {
+            val count = min(256, min(r_remaining / C.bytes,
+                min((4096 - (r_source & 4095)) / C.bytes,
+                    (4096 - (r_destination & 4095)) / C.bytes)));
+            assert(count > 0 && count <= 256, "AxiCopy: invalid chunk");
+            if (count > 0 && count <= 256) {
+                read.push(read_request(C, r_source, beats=count));
+                write.push(write_request(C, r_destination, beats=count));
+                r_chunk_bytes = count * C.bytes;
+                r_burst_active = true;
+            }
+        }
+        if (r_burst_active && read.can_pop() && write.can_push_data()) {
+            val beat = read.pop();
+            var strb: C.Strobe = 2**C.bytes - 1;
+            if (beat.resp != C.okay) { strb = 0; r_resp = beat.resp; }
+            val _ = write.push_data(beat.data, strb);
+        }
+        if (r_burst_active && write.can_pop()) {
+            val completion = write.pop();
+            if (completion.resp != C.okay) { r_resp = completion.resp; }
+            assert(r_chunk_bytes <= r_remaining, "AxiCopy: remaining underflow");
+            if (r_chunk_bytes <= r_remaining) {
+                val remaining = r_remaining - r_chunk_bytes;
+                // The preceding relational guard proves this. KHDL currently
+                // tracks interval bounds, not the relation between both values.
+                assert_assume(remaining >= 0);
+                r_remaining = remaining;
+            }
+            r_source = (r_source + r_chunk_bytes) & (2**C.addr_width - 1);
+            r_destination = (r_destination + r_chunk_bytes) & (2**C.addr_width - 1);
+            r_burst_active = false;
+        }
+        if (r_active && !r_burst_active && r_remaining == 0 && results.can_push()) {
+            results.push(CopyResult.new(tag=r_tag, resp=r_resp));
+            r_active = false;
+        }
+        results.end(); commands.end(); api.end();
+    }
+}

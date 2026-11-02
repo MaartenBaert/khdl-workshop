@@ -1,0 +1,173 @@
+import types.[InputPacket, EncodingPacket, LeafPacket, DecodingPacket, OutputPacket,
+    partial_type, packet_type];
+import transforms.encode_level;
+import routing.select_window;
+
+// Factories return typed functions; calls in a clocked process allocate their
+// own state. Placement into clock stages does not change the sample recurrence.
+pub fn make_step(C: type, index: uint) -> Function {
+    if (index == 0) { return alignment(C); }
+    if (index < C.leaf_first) { return encoding(C, index - 1); }
+    if (index < C.decode_first) { return leaf(C, index - C.leaf_first); }
+    if (index < C.round_step) { return decoding(C, index - C.decode_first); }
+    return quantization(C);
+}
+
+fn alignment(C: type) -> Function {
+    fn apply(enabled: bool, clear: bool, input: InputPacket(C), coefficients: C.Coefficients)
+        -> EncodingPacket(C, 0) {
+        reg r_phase: uint(0..C.phases) = 0;
+        reg r_prefix: [C.radix]C.Input = [0] * C.radix;
+        var result: EncodingPacket(C, 0) = undef;
+        result.clear = clear;
+        if (clear) {
+            r_phase = 0; r_prefix = [0] * C.radix;
+        } else if (enabled) {
+            result.phase = r_phase * C.phase_stride;
+            result.complete = (result.phase + C.parallel) / C.radix;
+            const width = C.radix * C.groups;
+            // Start at radix - phase in prefix + new input + zero padding.
+            // Removing the unreachable leading phase_stride samples makes
+            // every remaining offset one choice in a fixed barrel network.
+            val data = [*r_prefix[C.phase_stride..C.radix], *input.samples,
+                *([0] * (width - C.parallel))];
+            result.values = [select_window(width, C.phases, C.phase_stride,
+                C.phases - 1 - r_phase, data)];
+            r_prefix = input.samples[C.parallel - C.radix..C.parallel];
+            r_phase = (r_phase + C.parallel / C.phase_stride) % C.phases;
+        }
+        return result;
+    }
+    return apply;
+}
+
+fn encoding(C: type, level: uint) -> Function {
+    fn apply(enabled: bool, clear: bool, input: EncodingPacket(C, level), coefficients: C.Coefficients)
+        -> EncodingPacket(C, level + 1) {
+        var result: EncodingPacket(C, level + 1) = undef;
+        result.clear = clear;
+        if (enabled && !clear) {
+            result.phase = input.phase; result.complete = input.complete;
+            result.values = encode_level(C.input_w + level, 3**level,
+                C.radix * C.groups / 2**(level + 1), input.values);
+        }
+        return result;
+    }
+    return apply;
+}
+
+fn leaf(C: type, stage: uint) -> Function {
+    const start = (C.leaf_stages - 1 - stage) * C.taps_per_stage;
+    const count = min(C.taps_per_stage, C.leaf_taps - start);
+    type In = packet_type(C, C.leaf_first + stage);
+    type Previous = partial_type(C, stage);
+    fn apply(enabled: bool, clear: bool, input: In, coefficients: C.Coefficients)
+        -> LeafPacket(C, stage + 1) {
+        reg r_input: [C.leaves][count - 1]C.EncodedInput = [[0] * (count - 1)] * C.leaves;
+        reg r_partial: [C.leaves][count]Previous = [[0] * count] * C.leaves;
+        var result: LeafPacket(C, stage + 1) = undef;
+        result.clear = clear;
+        if (clear) {
+            r_input = [[0] * (count - 1)] * C.leaves;
+            r_partial = [[0] * count] * C.leaves;
+        } else if (enabled) {
+            result.phase = input.phase; result.complete = input.complete;
+            result.values = input.values;
+            for (b in 0..C.leaves) {
+                val data = [*r_input[b], *input.values[b]];
+                for (i in 0..C.groups) {
+                    var sum = 0;
+                    for (j in 0..count) {
+                        // Loading shifts h[0]'s encoded group to the end.
+                        sum += data[count - 1 + i - j] * coefficients[b][C.leaf_taps - 1 - start - j];
+                    }
+                    if (stage > 0) {
+                        val previous = [*r_partial[b], *input.partial[b]];
+                        sum += previous[i];
+                    }
+                    result.partial[b][i] = sum;
+                }
+                // Evaluate every lane, but commit only complete radix groups.
+                // A provisional last group is recomputed by the next packet.
+                const first = C.parallel / C.radix;
+                const choices = 1 + bool_to_int(C.parallel % C.radix != 0);
+                r_input[b] = select_window(count - 1, choices, 1,
+                    input.complete - first, data[first..data.len]);
+                if (stage > 0) {
+                    val previous = [*r_partial[b], *input.partial[b]];
+                    r_partial[b] = select_window(count, choices, 1,
+                        input.complete - first, previous[first..previous.len]);
+                }
+            }
+        }
+        return result;
+    }
+    return apply;
+}
+
+fn decoding(C: type, level: uint) -> Function {
+    type In = packet_type(C, C.decode_first + level);
+    const branches = C.leaves / 3**(level + 1);
+    const columns = C.groups * 2**level;
+    const bound = C.leaf_taps * C.product_bound * 3**level;
+    fn apply(enabled: bool, clear: bool, input: In, coefficients: C.Coefficients)
+        -> DecodingPacket(C, level + 1) {
+        reg r_carry: [branches]int(-bound..=bound) = [0] * branches;
+        var result: DecodingPacket(C, level + 1) = undef;
+        result.clear = clear;
+        if (clear) { r_carry = [0] * branches; }
+        else if (enabled) {
+            result.phase = input.phase; result.complete = input.complete;
+            var values;
+            if (level == 0) { values = input.partial; }
+            else { values = input.values; }
+            for (b in 0..branches) {
+                for (i in 0..columns) {
+                    var previous = r_carry[b];
+                    if (i > 0) { previous = values[3 * b + 2][i - 1]; }
+                    result.values[b][2 * i] = values[3 * b][i] + previous;
+                    result.values[b][2 * i + 1] = values[3 * b + 1][i]
+                        - values[3 * b][i] - values[3 * b + 2][i];
+                }
+                const first = C.parallel / C.radix;
+                const choices = 1 + bool_to_int(C.parallel % C.radix != 0);
+                const start = first * 2**level - 1;
+                r_carry[b] = select_window(1, choices, 2**level,
+                    input.complete - first, values[3 * b + 2][start..columns])[0];
+            }
+        }
+        return result;
+    }
+    return apply;
+}
+
+fn quantization(C: type) -> Function {
+    type In = packet_type(C, C.round_step);
+    const shift = C.input_f + C.coeff_f - C.output_f;
+    const low = -2**(C.output_w - 1);
+    const high = 2**(C.output_w - 1) - 1;
+    fn apply(enabled: bool, clear: bool, input: In, coefficients: C.Coefficients) -> OutputPacket(C) {
+        var result: OutputPacket(C) = undef;
+        result.clear = clear;
+        if (enabled && !clear) {
+            result.clipped = false;
+            var values;
+            if (C.depth == 0) { values = input.partial; }
+            else { values = input.values; }
+            val samples = select_window(C.parallel, C.phases, C.phase_stride,
+                input.phase / C.phase_stride, values[0]);
+            for (i in 0..C.parallel) {
+                var value = samples[i];
+                if (shift > 0) { value = (value + 2**(shift - 1)) / 2**shift; }
+                else if (shift < 0) { value = value * 2**(-shift); }
+                if (value < low) {
+                    result.samples[i] = low; result.clipped = true;
+                } else if (value > high) {
+                    result.samples[i] = high; result.clipped = true;
+                } else { result.samples[i] = value; }
+            }
+        }
+        return result;
+    }
+    return apply;
+}

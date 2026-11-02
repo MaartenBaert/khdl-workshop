@@ -1,0 +1,69 @@
+[[reed-solomon-chien]]
+=== RsChien
+
+Source: `rtl/reedsolo_chien.kh`.
+
+==== Function and interfaces
+
+`RsChien` computes the evaluator polynomial `omegas[t]` and searches
+for roots of the locator polynomial concurrently. The search scans ascending
+padded coefficient positions with `U` positions per clock, evaluating the
+locator at `alpha**(-z)`. Initial low padding positions are calculated but
+masked before counting roots or feeding the butterfly balancer.
+
+`input` is `RsTransaction(RsBerlekampBlock(RS=RS)).Sink`. `output` is
+`RsTransaction(RsChienBlock(U, RS=RS)).Source`. The locator passes through;
+the output adds evaluator coefficients, butterfly-arranged cycle/lane
+positions, inverse locations, the actual number of roots, and `failed`.
+`failed` is true when the root count differs from the incoming locator degree.
+The root counter is bounded by `t`; valid nonzero locator polynomials of
+degree at most `t` obey that bound. Arbitrary malformed standalone inputs
+such as an identically zero locator are outside the interface's algorithmic
+contract. Unused error slots are initialized to sentinel cycle
+`C=(n +/ U)`, with zero lane and inverse location.
+
+See <<reed-solomon-positions>> for the coordinate formulas and queue layout. `RsForney` and
+`RsCorrection` require this layout unchanged, including for non-power-of-two
+widths. The butterfly's internal width is the next power of two; its extra
+lanes carry no root flags.
+
+[cols="1,1,3",options="header"]
+|===
+|Parameter |Default |Effect / constraint
+|RS |RsDefault |Code and field configuration.
+|unroll_omegas |1 |`U_O` serial evaluator iterations per cycle; must divide `t`.
+|unroll_chien |1 |Any positive `U` search lanes and error-position layout width.
+|===
+
+==== Timing and search extent
+
+Evaluator work takes `O=t/U_O` cycles; search takes `C=(n +/ U)`
+cycles. They start together on the input acceptance edge and run
+independently until both finish. The output can transfer
+`H=max(O,C)` cycles after input acceptance. A new block can be accepted
+on that transfer edge; the minimum initiation interval is `H` cycles.
+Computation proceeds while downstream is stalled, then the completed
+transaction waits without changing.
+
+.Evaluator computation finishes first; RsChien waits for the fourth search group.
+[wavedrom]
+....
+{"signal":[
+  {"name":"clk","wave":"p....."},
+  {"name":"input.valid","wave":"10...."},
+  {"name":"input.ready","wave":"10..1."},
+  {"name":"search z","wave":"2345x.","data":["0..3","4..7","8..11","12..15"]},
+  {"name":"omega work","wave":"2x....","data":["3 iterations"]},
+  {"name":"output.valid","wave":"0...10"},
+  {"name":"output.ready","wave":"1....."},
+  {"name":"output block","wave":"x...2x","data":["result"]}
+],"head":{"text":"RsChien: RS(13,7), U=4, U_O=3; z=0..2 masked","tick":0},"config":{"hscale":3}}
+....
+
+Only the first search group can contain padding. The final search group
+contains the highest codeword coefficients and is fully valid. This is
+the reverse of where padding appears in the streamed frame. Constant
+field exponents are reduced modulo `q-1` during elaboration; the runtime
+search counter uses a guarded increment and reset, with no field-period
+modulo operation. Widths exceeding the code length or field period are
+supported because all non-codeword search positions are masked.

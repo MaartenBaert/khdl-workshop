@@ -1,0 +1,19 @@
+import reedsolo.[RsDefault];
+
+// Combinational wrapper for exhaustive hardware arithmetic verification.
+module RsGfMul(RS: type = RsDefault) ports(
+    async {
+        a: in RS.Sym,
+        b: in RS.Sym,
+        long_value: in RS.SymLong,
+        product: out RS.Sym,
+        long_product: out RS.SymLong,
+        reduced: out RS.Sym,
+    }
+) {
+    comb {
+        product = RS.gf_mul(a, b);
+        long_product = RS.gf_mul_long(a, b);
+        reduced = RS.gf_reduce(long_value);
+    }
+}

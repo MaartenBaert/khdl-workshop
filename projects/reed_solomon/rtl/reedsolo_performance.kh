@@ -1,0 +1,209 @@
+// Elaboration-time timing models and optional parallelism selection.
+// Latency is first input transfer to first output transfer. Frame interval
+// is sustained cycles/frame with continuous input and an always-ready sink.
+import reedsolo.[RsDefault];
+import reedsolo_decoder.[RsDecoderParallelism, RsMessageBuffer];
+import reedsolo_packet_fifo.[RsFifoMemory];
+
+// Exact cycles/frame, including fractional averages from worker replication.
+pub struct RsFrameInterval {
+    cycles: positive,
+    frames: positive,
+}
+
+pub fn frame_interval(cycles: positive, frames: positive = 1) -> RsFrameInterval {
+    val divisor = gcd(cycles, frames);
+    return RsFrameInterval.new(cycles=cycles / divisor, frames=frames / divisor);
+}
+
+pub struct RsTiming {
+    latency: uint,
+    interval: RsFrameInterval,
+}
+
+fn timing(latency: uint, cycles: positive, instances: positive = 1) -> RsTiming {
+    // A block transaction port transfers at most one frame per cycle.
+    return RsTiming.new(latency=latency, interval=frame_interval(max(cycles, instances), instances));
+}
+
+fn slower(a: RsFrameInterval, b: RsFrameInterval) -> RsFrameInterval {
+    if (a.cycles * b.frames >= b.cycles * a.frames) {
+        return a;
+    } else {
+        return b;
+    }
+}
+
+pub fn round_robin_timing() -> RsTiming {
+    return timing(0, 1);
+}
+
+pub fn encoder_timing(RS: type = RsDefault, unroll: positive = 1) -> RsTiming {
+    return timing(1, RS.n +/ unroll);
+}
+
+pub fn syndromes_timing(RS: type = RsDefault, unroll: positive = 1) -> RsTiming {
+    val cycles = RS.n +/ unroll;
+    return timing(cycles, cycles);
+}
+
+pub fn berlekamp_timing(
+    RS: type = RsDefault, unroll: positive = 1, instances: positive = 1,
+) -> RsTiming {
+    assert(2 * RS.t % unroll == 0, "Berlekamp unroll must divide 2*t");
+    val cycles = 2 * RS.t / unroll;
+    return timing(cycles, cycles, instances);
+}
+
+pub fn chien_timing(
+    RS: type = RsDefault, unroll_chien: positive = 1, unroll_omegas: positive = 1,
+) -> RsTiming {
+    assert(RS.t % unroll_omegas == 0, "Omega unroll must divide t");
+    val cycles = max(RS.n +/ unroll_chien, RS.t / unroll_omegas);
+    return timing(cycles, cycles);
+}
+
+pub fn forney_timing(
+    RS: type = RsDefault, unroll: positive = 1, instances: positive = 1,
+) -> RsTiming {
+    assert(unroll <= 2 * RS.t, "Forney unroll must not exceed 2*t");
+    val cycles = ((RS.t +/ 2) - RS.fcr + RS.t + 2) +/ unroll;
+    return timing(cycles, cycles, instances);
+}
+
+pub fn correction_timing(RS: type = RsDefault, unroll: positive = 1) -> RsTiming {
+    return timing(1, RS.k +/ unroll);
+}
+
+pub fn decoder_timing(RS: type, parallelism: RsDecoderParallelism) -> RsTiming {
+    val s = syndromes_timing(RS, parallelism.stream_unroll);
+    val b = berlekamp_timing(RS, parallelism.berlekamp_unroll, parallelism.berlekamp_instances);
+    val h = chien_timing(RS, parallelism.stream_unroll, parallelism.omegas_unroll);
+    val f = forney_timing(RS, parallelism.forney_unroll, parallelism.forney_instances);
+    val c = correction_timing(RS, parallelism.stream_unroll);
+    return RsTiming.new(
+        latency=s.latency + b.latency + h.latency + f.latency + c.latency,
+        interval=slower(slower(slower(slower(s.interval, b.interval), h.interval), f.interval), c.interval),
+    );
+}
+
+// Relative technology-dependent costs. Scale fractional weights to integers;
+// a common scale factor does not change the selected configuration.
+pub struct RsLinearCost {
+    a: uint,
+    b: uint,
+    fn at(self, unroll: positive) -> uint {
+        return self.a * unroll + self.b;
+    }
+}
+
+pub struct RsChienCost {
+    a_search: uint,
+    a_omegas: uint,
+    b: uint,
+}
+
+pub struct RsDecoderCosts {
+    syndromes: RsLinearCost,
+    berlekamp: RsLinearCost,
+    chien: RsChienCost,
+    forney: RsLinearCost,
+    correction: RsLinearCost,
+}
+
+pub fn decoder_cost(parallelism: RsDecoderParallelism, costs: RsDecoderCosts) -> uint {
+    return costs.syndromes.at(parallelism.stream_unroll)
+        + parallelism.berlekamp_instances * costs.berlekamp.at(parallelism.berlekamp_unroll)
+        + costs.chien.a_search * parallelism.stream_unroll + costs.chien.a_omegas * parallelism.omegas_unroll + costs.chien.b
+        + parallelism.forney_instances * costs.forney.at(parallelism.forney_unroll)
+        + costs.correction.at(parallelism.stream_unroll);
+}
+
+pub fn select_encoder_unroll(
+    RS: type, max_latency: uint, max_cycles_per_frame: RsFrameInterval,
+) -> positive {
+    assert(max_latency >= 1, "Encoder first-output latency is one cycle");
+    assert(max_cycles_per_frame.cycles >= max_cycles_per_frame.frames,
+        "Encoder cannot sustain less than one cycle per frame");
+    // Its interval is integral. U>n cannot improve on one cycle/frame.
+    return (RS.n +/ (max_cycles_per_frame.cycles / max_cycles_per_frame.frames));
+}
+
+pub fn select_decoder_parallelism(
+    RS: type, max_unroll_berlekamp: positive, max_unroll_forney: positive,
+    costs: RsDecoderCosts, max_latency: uint, max_cycles_per_frame: RsFrameInterval,
+) -> RsDecoderParallelism {
+    assert(max_cycles_per_frame.cycles >= max_cycles_per_frame.frames,
+        "Decoder cannot sustain less than one cycle per frame");
+    var found = false;
+    var best = RsDecoderParallelism.new(
+        stream_unroll=1, berlekamp_unroll=1, omegas_unroll=1, forney_unroll=1,
+        berlekamp_instances=1, forney_instances=1,
+    );
+    var best_cost = 0;
+    for (u in 1..=RS.n) {
+        val c = RS.n +/ u;
+        // For a given C, the smallest U has identical timing and no higher
+        // linear cost. Widths beyond n are likewise dominated by U=n.
+        var distinct = true;
+        if (u > 1) {
+            distinct = c != (RS.n +/ (u - 1));
+        }
+        if (distinct) {
+            for (uo in 1..=RS.t) {
+                if (RS.t % uo == 0) {
+                    val h = max(c, RS.t / uo);
+                    if (h * max_cycles_per_frame.frames <= max_cycles_per_frame.cycles) {
+                        for (ub in 1..=min(2 * RS.t, max_unroll_berlekamp)) {
+                            if (2 * RS.t % ub == 0) {
+                                val b = 2 * RS.t / ub;
+                                val nb = max(1, ((b * max_cycles_per_frame.frames) +/ max_cycles_per_frame.cycles));
+                                for (uf in 1..=min(2 * RS.t, max_unroll_forney)) {
+                                    val f = ((RS.t +/ 2) - RS.fcr + RS.t + 2) +/ uf;
+                                    if (c + b + h + f + 1 <= max_latency) {
+                                        val nf = max(1, ((f * max_cycles_per_frame.frames) +/ max_cycles_per_frame.cycles));
+                                        val candidate = RsDecoderParallelism.new(
+                                            stream_unroll=u, berlekamp_unroll=ub, omegas_unroll=uo, forney_unroll=uf,
+                                            berlekamp_instances=nb, forney_instances=nf,
+                                        );
+                                        val cost = decoder_cost(candidate, costs);
+                                        // Equal costs retain the first candidate: ascending
+                                        // stream/omega/BM/Forney widths, minimal worker counts.
+                                        if (!found || cost < best_cost) {
+                                            best = candidate;
+                                            best_cost = cost;
+                                            found = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert(found, "No decoder parallelism satisfies the latency and cycles/frame limits under the unroll caps");
+    return best;
+}
+
+// Message buffer that sustains one frame per `max_cycles_per_frame` cycles,
+// whether frames arrive at that rate or the buffer throttles a faster source.
+// A frame's message beats occupy the buffer for latency - 1 cycles, from just
+// after its first input beat to just before its last output beat, counting
+// the edge at which a full buffer cannot reuse a slot. Room for m frames
+// therefore sustains one frame per (latency - 1) / m cycles. Within the
+// decoder's own interval, the result never exceeds full_message_buffer. The
+// sizing assumes the buffer shows committed data before RsCorrection needs
+// it, as bypass does.
+pub fn select_message_buffer(
+    RS: type, parallelism: RsDecoderParallelism, max_cycles_per_frame: RsFrameInterval,
+    memory: RsFifoMemory = RsFifoMemory.Lut, bypass: bool = true,
+) -> RsMessageBuffer {
+    val model = decoder_timing(RS, parallelism);
+    assert(model.interval.cycles * max_cycles_per_frame.frames
+            <= max_cycles_per_frame.cycles * model.interval.frames,
+        "The decoder cannot sustain the requested cycles/frame");
+    val frames = ((model.latency - 1) * max_cycles_per_frame.frames) +/ max_cycles_per_frame.cycles;
+    return RsMessageBuffer.new(depth=frames * (RS.k +/ parallelism.stream_unroll), memory=memory, bypass=bypass);
+}

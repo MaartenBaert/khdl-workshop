@@ -1,0 +1,170 @@
+[[reed-solomon-stages]]
+== Decoder stage reference
+
+`RsDecoder` is built from five stage modules, two routers, a packet FIFO for
+the message symbols, and the field arithmetic in `RS`. Most users only need
+`RsDecoder`. This chapter documents the stages for integrators who instantiate
+them individually, for example to insert their own buffering or to reuse one
+stage, and for maintainers.
+
+All stages follow the clock, reset, and handshake rules of
+<<reed-solomon-interfaces>>. A frame takes two paths through the decoder:
+
+* The decoding information travels as a single *block transaction* per frame,
+  from `RsSyndromes` through `RsBerlekamp`, `RsChien`, and `RsForney` to
+  `RsCorrection`. Each of these stages works on one block at a time and holds
+  its result until the next stage accepts it.
+* The received message symbols bypass those stages. `RsSyndromes` forwards
+  them as a stream of message beats into an `RsPacketFifo`, committing each
+  complete frame and cancelling malformed ones, and `RsCorrection` reads them
+  back beat by beat while it applies the corrections
+  (<<reed-solomon-message-path>>).
+
+Several stages also use a shared coordinate system for error positions.
+
+[[reed-solomon-blocks]]
+=== Block transactions
+
+Block interfaces use `RsTransaction(T)` from `rtl/reedsolo_interfaces.kh`, with
+forward `data: T` and `valid` and reverse `ready`. They follow the same
+transfer and stability rules as streams, but transfer an entire payload struct
+at one clock edge, so they have no `last` field.
+
+[cols="1,3",options="header"]
+|===
+|Payload struct T |Fields within data
+|RsSyndromesBlock(RS)
+|`syndromes[2*t]`
+|RsBerlekampBlock(RS)
+|Previous fields, `lambdas[t+1]`, `num_errors` in `0..=2*t`
+|RsChienBlock(unroll_chien, RS)
+|`omegas[t]`, `lambdas[t+1]`, `error_cpos[t]`,
+`error_upos[t]`, `error_xinv[t]`, `num_errors` in `0..=t`, `failed`
+|RsForneyBlock(unroll_chien, RS)
+|`error_cpos[t]`, `error_upos[t]`, `error_val[t]`,
+`num_errors` in `0..=t`, `failed`
+|===
+
+For example, `RsBerlekamp` consumes `RsTransaction(RsSyndromesBlock(RS=RS)).Sink`
+and reads `input.data.syndromes`. Stages forward whole payloads with
+`output.data = input.data`, so routers need not list struct fields. The struct
+types carry `RS` and the position width, so blocks from different
+configurations cannot be connected even when their sizes match.
+
+Syndromes are indexed by consecutive root: `syndromes[j]` is the received
+padded polynomial evaluated at `alpha**(fcr+j)`. The locator `lambdas` and
+evaluator `omegas` arrays are low coefficient first. `RsBerlekamp` uses an
+inversionless algorithm, so the locator need not be normalized to constant
+term one. Its `num_errors` is the estimated locator degree; `RsChien` replaces
+it with the number of roots actually found.
+
+Each block payload is exported as one packed port, `input_data` or
+`output_data`, next to `input_valid`/`input_ready` or
+`output_valid`/`output_ready`. There is no separate port such as
+`output_error_cpos`. Python benches construct a payload with
+`inst.info_ports.input.data.type.new(syndromes=...)` and read fields as
+`inst.ports.output.data.syndromes`.
+
+[[reed-solomon-message-path]]
+=== The message path
+
+A frame's message symbols occupy the first `K=(k +/ U)` beats of its codeword
+stream, in exactly the beats and lanes that the decoded message stream uses
+(<<reed-solomon-ordering>>). The final message beat may also hold parity
+symbols in its low lanes. `RsSyndromes` therefore forwards those `K` codeword
+beats unchanged, and `RsCorrection` clears the extra lanes of the final beat
+when it emits it.
+
+`RsSyndromes` has a `message: RsTransaction([U]RS.Sym).Source` output with
+registered `valid` and `data`, and two registered flags for a packet FIFO:
+
+* `message_commit` makes a complete frame's beats visible. It stays asserted
+  until the frame's last message beat has been accepted, so it may commit the
+  earlier beats first, which is harmless.
+* `message_cancel` discards a malformed frame's beats, for one cycle, after its
+  final beat, which is never forwarded. The next frame's beats follow later.
+
+A message beat, or any frame's final beat, is only processed while the message
+output register is free, so the beats of different frames never mix with each
+other's commit or cancel. Without the input holding register (`buffered=false`),
+`input.ready` includes that condition combinationally.
+
+`RsCorrection` has a `message: RsTransaction([U]RS.Sym).Sink` input. It takes
+one message beat for each output beat, while it processes a block, including
+in the cycle the block arrives, so the first output beat still follows the
+block's acceptance by one cycle. Its `message.ready` depends combinationally on
+`output.ready` and `input.valid`.
+
+`RsDecoder` connects the two through an `RsPacketFifo` configured by its
+`message_buffer` parameter (<<reed-solomon-decoder-message-buffer>>). Because
+frames leave the block stages in order, the FIFO's oldest frame always belongs
+to the block that `RsCorrection` processes.
+
+[[reed-solomon-positions]]
+=== Padded coordinates and error slots
+
+The stream padding of <<reed-solomon-ordering>> also shapes the decoder's
+internal coordinates. For the input width of `RsSyndromes` and the search
+width of `RsChien`, both `U`, define `C=(n +/ U)` and `P_n=C*U-n`.
+`RsSyndromes` evaluates `F(x)=x**P_n * C_received(x)`, which keeps every
+update full width, even on the final padded beat. A received error at true
+codeword coefficient `j` therefore sits at padded coefficient `z=j+P_n`.
+`RsChien` reports it as:
+
+----
+error_cpos = z / U       (integer division: search cycle)
+error_upos = z % U       (lane index)
+error_xinv = alpha**(-z) (exponent interpreted modulo q-1)
+----
+
+The search runs from low coefficients to high, the reverse of stream order.
+Codeword stream beat `b` corresponds to search cycle `C-1-b`, with the *same
+lane indices*. `RsChien` computes all lanes but masks `z<P_n` in cycle zero
+before counting roots. This also prevents false roots at padding coordinates
+that alias a valid position when the rounded length exceeds `q-1`.
+
+For RS(13,7), `U=4`, `P_n=3`:
+
+[cols="1,1,3",options="header"]
+|===
+|Search cycle |Stream beat |Lanes zero through three
+|0 |3 |`[0 0 0 p0]`
+|1 |2 |`[p1 p2 p3 p4]`
+|2 |1 |`[p5 d0 d1 d2]`
+|3 |0 |`[d3 d4 d5 d6]`
+|===
+
+The error arrays are *not a sorted list of positions*. `RsChien` fills them
+through a butterfly balancer, which evens out how many errors each lane can
+hold. With `W=2**clog2(U)`, slot `i` belongs to the queue
+`i, i+W, i+2*W, ...`, and newer search-cycle hits are at the head of each
+queue. `RsForney` preserves the slots. `RsCorrection` visits message groups in
+reverse search order and uses the inverse butterfly to restore lane
+placement. Do not reorder error slots between these modules. Only slots with
+`error_cpos<C` describe positions. Unused slots carry the sentinel `C`, with
+zero lane and inverse location; `RsForney` still computes magnitudes for them,
+which must not be interpreted as errors.
+
+`RsSyndromes` and `RsChien` must use the same padding coordinates, which
+using the same stream and search width ensures. `RsChien`, the position width
+of `RsForney`, and `RsCorrection` must use matching widths, because positions
+are cycle/lane pairs; their interfaces enforce this, and the `RS` identity.
+The interfaces between `RsSyndromes`, `RsBerlekamp`, and `RsChien` do not encode
+the input width of `RsSyndromes`, so standalone integrators must preserve the
+padding agreement themselves. `RsDecoder` does this automatically.
+
+include::modules/syndromes.adoc[]
+
+include::modules/berlekamp.adoc[]
+
+include::modules/chien.adoc[]
+
+include::modules/forney.adoc[]
+
+include::modules/correction.adoc[]
+
+include::modules/round_robin.adoc[]
+
+include::modules/packet_fifo.adoc[]
+
+include::modules/gf-mul.adoc[]

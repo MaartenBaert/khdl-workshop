@@ -1,0 +1,92 @@
+import axi.types.AxiDefault;
+import axi.interfaces.Axi;
+import axi.subordinate.[subordinate, ReadRequest, WriteRequest];
+import channel.buffers.storage;
+
+struct WriteCompletion(capacity: positive) { token: uint(0..capacity), resp: uint(2) }
+
+// A beat addresses the SIZE-aligned bytes containing its address; strobes and
+// lane masks only select bytes within them. Reads and writes use the same rule,
+// and an out-of-range beat neither reads nor writes memory.
+fn beat_in_range(address: any, size: uint(3), memory_bytes: uint) -> bool {
+    val bytes = 1 << size;
+    return address - (address & (bytes - 1)) + bytes <= memory_bytes;
+}
+
+// Byte-addressed demonstration backend. Request/data association, IDs and LAST
+// belong to the reusable Subordinate API; this process only services memory.
+// memory_bytes=0 is the error destination and needs no payload storage.
+pub module AxiRam(C: type = AxiDefault, memory_bytes: uint = 4096, capacity: positive = 2,
+    queue_depth: positive = 2) ports(
+    clk: in clock,
+    rst: in async bool,
+    bus: interface sync(clk, async rst) Axi(C).Subordinate,
+) {
+    clocked(clk, async rst) {
+        val api = subordinate(C, ref(bus), capacity);
+        val reads = storage(ReadRequest(C, capacity), queue_depth);
+        val writes = storage(WriteRequest(C, capacity), queue_depth);
+        val completions = storage(WriteCompletion(capacity), queue_depth);
+        reg r_memory: [memory_bytes]uint(8) = undef;
+        reg r_write_error: bool = false;
+        api.begin(); reads.begin(); writes.begin(); completions.begin();
+        if (api.read.can_pop() && reads.can_push()) { reads.push(api.read.pop()); }
+        if (api.write.can_pop() && writes.can_push()) { writes.push(api.write.pop()); }
+
+        // Reads precede writes, so a same-cycle collision observes old data.
+        if (reads.can_pop()) {
+            val request = reads.peek();
+            if (api.read.can_respond(request.token)) {
+                val address = api.read.address(request.token);
+                val mask = api.read.strobes(request.token);
+                val base = address - (address & (C.bytes - 1));
+                val in_range = beat_in_range(address, request.address.size, memory_bytes);
+                var data: C.Data = 0;
+                if (memory_bytes > 0 && in_range) {
+                    for (lane in 0..C.bytes) {
+                        val byte = base + lane;
+                        // in_range implies these bounds; the guard lets range analysis see them.
+                        if ((mask & (1 << lane)) != 0 && byte >= 0 && byte < memory_bytes) {
+                            data = data | (r_memory[byte] << (8 * lane));
+                        }
+                    }
+                }
+                var resp = C.okay;
+                if (!in_range) { resp = C.decerr; }
+                if (api.read.respond(request.token, data, resp)) { val _ = reads.pop(); }
+            }
+        }
+        if (writes.can_pop()) {
+            val request = writes.peek();
+            if (api.write.can_pop_data(request.token) && completions.can_push()) {
+                val beat = api.write.pop_data(request.token);
+                val base = beat.addr - (beat.addr & (C.bytes - 1));
+                val in_range = beat_in_range(beat.addr, request.address.size, memory_bytes);
+                if (!in_range) { r_write_error = true; }
+                if (memory_bytes > 0 && in_range) {
+                    for (lane in 0..C.bytes) {
+                        val byte = base + lane;
+                        if ((beat.strb & (1 << lane)) != 0 && byte >= 0 && byte < memory_bytes) {
+                            r_memory[byte] = (beat.data >> (8 * lane)) & 255;
+                        }
+                    }
+                }
+                if (beat.last) {
+                    var resp = C.okay;
+                    if (r_write_error) { resp = C.decerr; }
+                    completions.push(WriteCompletion(capacity).new(token=request.token, resp=resp));
+                    val _ = writes.pop();
+                    r_write_error = false;
+                }
+            }
+        }
+        if (completions.can_pop()) {
+            val completion = completions.peek();
+            if (api.write.can_complete(completion.token)) {
+                api.write.complete(completion.token, completion.resp);
+                val _ = completions.pop();
+            }
+        }
+        completions.end(); writes.end(); reads.end(); api.end();
+    }
+}

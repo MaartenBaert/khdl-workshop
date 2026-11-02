@@ -1,0 +1,55 @@
+// Adversarial application scheduling: gather three jobs, then try completing
+// them in reverse order. The API must permit different-ID reordering while
+// refusing a younger same-ID job until its predecessor has completed.
+import axi.types.AxiDefault;
+import axi.interfaces.Axi;
+import axi.subordinate.[subordinate, ReadRequest, WriteRequest];
+
+module ReorderProbe(C: type = AxiDefault) ports(
+    clk: in clock, rst: in async bool,
+    bus: interface sync(clk, async rst) Axi(C).Subordinate,
+) {
+    clocked(clk, async rst) {
+        val api = subordinate(C, ref(bus), capacity=3);
+        reg r_reads: [3]ReadRequest(C, 3) = undef;
+        reg r_read_valid: [3]bool = [false] * 3;
+        reg r_read_service = false;
+        reg r_writes: [3]WriteRequest(C, 3) = undef;
+        reg r_write_valid: [3]bool = [false] * 3;
+        reg r_write_received: [3]bool = [false] * 3;
+        reg r_write_service = false;
+        api.begin();
+        for (i in 0..3) {
+            if (!r_read_service && !r_read_valid[i] && api.read.can_pop()) {
+                r_reads[i] = api.read.pop(); r_read_valid[i] = true;
+            }
+            if (!r_write_service && !r_write_valid[i] && api.write.can_pop()) {
+                r_writes[i] = api.write.pop(); r_write_valid[i] = true; r_write_received[i] = false;
+            }
+            if (r_write_valid[i] && !r_write_received[i] && api.write.can_pop_data(r_writes[i].token)) {
+                val beat = api.write.pop_data(r_writes[i].token);
+                assert(beat.data == (r_writes[i].address.addr & (2**C.data_width - 1)), "wrong write context");
+                if (beat.last) { r_write_received[i] = true; }
+            }
+        }
+        if (r_read_valid[0] && r_read_valid[1] && r_read_valid[2]) { r_read_service = true; }
+        if (r_write_received[0] && r_write_received[1] && r_write_received[2]) { r_write_service = true; }
+        for (step in 0..3) {
+            val i = 2 - step;
+            if (r_read_service && r_read_valid[i] && api.read.can_respond(r_reads[i].token)) {
+                if (api.read.respond(r_reads[i].token, r_reads[i].address.addr & (2**C.data_width - 1))) {
+                    r_read_valid[i] = false;
+                }
+            }
+            if (r_write_service && r_write_valid[i] && api.write.can_complete(r_writes[i].token)) {
+                api.write.complete(r_writes[i].token);
+                r_write_valid[i] = false;
+            }
+        }
+        if (!r_read_valid[0] && !r_read_valid[1] && !r_read_valid[2]) { r_read_service = false; }
+        if (!r_write_valid[0] && !r_write_valid[1] && !r_write_valid[2]) {
+            r_write_service = false; r_write_received = [false] * 3;
+        }
+        api.end();
+    }
+}

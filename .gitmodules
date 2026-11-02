@@ -1,0 +1,3 @@
+[submodule "khdl"]
+	path = khdl
+	url = https://github.com/khdl-lang/khdl.git

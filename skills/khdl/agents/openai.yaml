@@ -1,0 +1,4 @@
+interface:
+  display_name: "KHDL"
+  short_description: "Develop and verify hardware with current KHDL"
+  default_prompt: "Use $khdl to implement and verify hardware against this project's checked-out KHDL compiler."

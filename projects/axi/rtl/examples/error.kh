@@ -1,0 +1,10 @@
+import axi.types.AxiDefault;
+import axi.interfaces.Axi;
+import examples.ram.AxiRam;
+
+pub module AxiError(C: type = AxiDefault, capacity: positive = 2) ports(
+    clk: in clock, rst: in async bool,
+    bus: interface sync(clk, async rst) Axi(C).Subordinate,
+) {
+    instance AxiRam(C, memory_bytes=0, capacity=capacity) ports(clk, rst, bus);
+}

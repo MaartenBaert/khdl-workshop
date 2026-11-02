@@ -1,0 +1,349 @@
+[[axi4-manager]]
+== Issuing transactions: the Manager API
+
+Source: `rtl/axi/manager.kh`.
+
+A Manager component often has several independent activities. A DMA engine,
+for example, might fetch small descriptors, read large payload buffers, and
+write results. If all three shared one queue, a payload consumer that stalls
+would also stop descriptor fetches.
+
+The Manager API therefore models each activity as an *endpoint*: a logical
+client with its own AXI ID, its own limit on outstanding transactions, and its
+own response buffer. `manager(...)` attaches a set of endpoints to one
+physical bus. It arbitrates their requests onto the bus and routes each
+response back by ID. Because an endpoint uses a single ID, its results arrive
+in submission order. Endpoints use different IDs, so they complete
+independently of each other, within the limits of their buffers.
+
+The application never sees an ID, a token, or a LAST signal it has to compute.
+It pushes requests into an endpoint and pops results from it.
+
+[[axi4-manager-example]]
+=== A first example
+
+This module reads a descriptor from a given address, then reads a four-beat
+payload from the address stored in that descriptor:
+
+----
+import axi.types.[AxiDefault, read_request];
+import axi.interfaces.Axi;
+import axi.manager.[manager, read_endpoint];
+
+module ManagerExample(C: type = AxiDefault) ports(
+    clk: in clock, rst: in async bool,
+    sync(clk, async rst) {
+        bus: interface Axi(C).Manager,
+        start: in bool,
+        address: in C.Addr,
+        consumer_ready: in bool,
+    }
+) {
+    clocked(clk, async rst) {
+        val descriptors = read_endpoint(C, id=0);
+        val payloads = read_endpoint(C, id=1, capacity=3, response_depth=2);
+        val api = manager(C, ref(bus), reads=(descriptors, payloads));
+        api.begin();
+        if (start && descriptors.can_push()) {
+            descriptors.push(read_request(C, address));
+        }
+        if (descriptors.can_pop() && payloads.can_push()) {
+            val descriptor = descriptors.pop();
+            payloads.push(read_request(C, descriptor.data, beats=4));
+        }
+        if (payloads.can_pop() && consumer_ready) {
+            val beat = payloads.pop();
+            // Consume beat.data; beat.last marks the end of each burst.
+        }
+        api.end();
+    }
+}
+----
+
+Step by step:
+
+. Each `rtl/` subdirectory is a KHDL namespace, so the API is imported from
+  `axi.types`, `axi.interfaces`, and `axi.manager`. `C` is a configuration
+  type that fixes the bus widths. `AxiDefault` uses
+  32-bit addresses and data with 4-bit IDs (see <<axi4-configuration>>). The
+  `bus` port uses the Manager view of the `Axi(C)` interface.
+. `read_endpoint` creates each endpoint's state inside the clocked process. The
+  descriptor endpoint uses ID 0 and allows one outstanding read. The payload
+  endpoint uses ID 1, allows three outstanding reads, and buffers up to two
+  received beats.
+. `manager` attaches both endpoints to the bus. The application keeps using the
+  endpoint names `descriptors` and `payloads` directly.
+. `api.begin()` and `api.end()` run unconditionally every cycle. They also
+  service both endpoints, so never call `begin()` or `end()` on an endpoint.
+. Requests are pushed only when `can_push()` holds, and results are popped only
+  when `can_pop()` holds. The descriptor is popped only when the payload endpoint
+  can accept the follow-up request, so no descriptor is lost.
+
+`read_request` builds a full-width INCR request by default. Submission checks
+the request against the AXI4 rules (see <<axi4-bursts>>). In this example the
+descriptor must therefore contain an address at which a four-beat burst does
+not cross a 4 KiB boundary.
+
+[[axi4-manager-endpoints]]
+=== Creating endpoints
+
+`read_endpoint(C, id=0, capacity=1, response_depth=1)` and
+`write_endpoint(C, id=0, capacity=1, response_depth=1)` take the same
+parameters. All three parameters are elaboration-time constants:
+
+[options="header",cols="1,4"]
+|===
+|Parameter |Meaning
+|`id`
+|The endpoint's AXI ID. It must fit in `C.id_width` bits and be unique among
+ the endpoints of the same direction. A read endpoint and a write endpoint may
+ share an ID, because AXI read and write IDs are independent.
+|`capacity`
+|The number of transactions this endpoint can have outstanding. Each
+ outstanding transaction occupies one _context_, a small record of its burst
+ length and progress. A read's context is freed when its final beat is popped.
+ A write's context is freed when its completion is popped.
+|`response_depth`
+|The number of received response messages buffered locally. A depth of one
+ uses a single `Internal` slot, which the application can pop in the same cycle
+ the response arrives. A depth of two or more uses a `Fifo`, which adds
+ scheduling latency but separates its input and output sides (see
+ <<axi-channel-reference>>).
+|===
+
+Each endpoint also has its own one-entry slot for a pending address request,
+and write endpoints have one for pending write data. These slots let an
+endpoint accept work before it wins access to the bus (see
+<<axi4-manager-internals>>).
+
+[[axi4-manager-attach]]
+=== Attaching endpoints to the bus
+
+`manager(C, ref(bus), reads=..., writes=...)` takes the endpoints as tuples:
+`reads=(descriptors, payloads)` and `writes=(writes,)`. The trailing comma makes
+a one-element tuple. Omitting a direction passes the empty tuple `()` and
+disables that direction. `manager` creates no endpoints of its own.
+
+Elaboration checks that IDs are in range and unique within each direction,
+and that read endpoints are not passed as writers or vice versa. A tuple may
+contain endpoints with different capacities and response depths. KHDL unrolls
+the traversal of the tuple at elaboration, so each endpoint keeps its own
+concrete type.
+
+The returned Manager holds aliases to the same endpoint objects. It neither
+copies their state nor constructs replacements, so application code continues
+to use the original names. Only the Manager owns `begin()` and `end()`.
+
+[[axi4-manager-reads]]
+=== Reading
+
+To start a read, push an AR request into a read endpoint:
+
+----
+if (read.can_push()) {
+    read.push(read_request(C, address, beats=4));
+}
+----
+
+The endpoint replaces the request's ID with its own. The read's results arrive
+as one `ReadBeat(C)` per data beat, with fields `data`, `resp`, `last`, and
+`user`. The endpoint computes `last` from the request's length, so the
+application can tell where bursts end without tracking LEN itself. Results
+appear in submission order. Applications that need metadata for each
+outstanding request, such as a destination for each burst, can keep it in a
+local FIFO, which they then pop in the same order.
+
+[[axi4-manager-writes]]
+=== Writing
+
+A write takes three steps: push the AW request, supply each data beat, and pop
+the completion. The following example writes four-beat bursts:
+
+----
+val writer = write_endpoint(C, id=0, capacity=2);
+val api = manager(C, ref(bus), reads=(), writes=(writer,));
+api.begin();
+if (start && writer.can_push()) {
+    writer.push(write_request(C, address, beats=4));
+}
+if (data_available && writer.can_push_data()) {
+    val last = writer.push_data(data, 2**C.bytes - 1);
+}
+if (writer.can_pop()) {
+    val completion = writer.pop();
+    // completion.resp is C.okay unless the Subordinate reported an error.
+}
+api.end();
+----
+
+`can_push_data()` is true when the endpoint has a submitted burst that still
+needs data, and its pending-data slot is free. Data always goes to the oldest
+such burst. `push_data(data, strb, user=0)` generates WLAST and returns true
+for the burst's final beat. The strobe must select a subset of the lanes that
+the beat's address and size permit. Full-width aligned bursts permit every
+lane, so the example's `2**C.bytes - 1` writes all bytes. Data may be supplied
+gradually: there is no need to buffer a whole burst first, as long as the
+data source makes progress independently (see <<axi4-manager-progress>>).
+
+Each burst produces one `WriteCompletion(C)`, with fields `resp` and `user`.
+Completions appear in submission order.
+
+[[axi4-manager-operations]]
+=== Operation reference
+
+[options="header",cols="1,2,3"]
+|===
+|Object |Operation |Contract
+|Manager |`begin()`, `end()` |Called unconditionally once per cycle. Services the bus and every attached endpoint.
+|Both endpoints |`can_push()` |Local context capacity and the pending-request slot are available.
+|Read endpoint |`push(C.Ar)` |Validate and queue AR, replacing its ID with the endpoint ID. Requires `can_push()`.
+|Write endpoint |`push(C.Aw)` |Validate and queue AW, replacing its ID with the endpoint ID. Requires `can_push()`.
+|Write endpoint |`can_push_data()` |This endpoint has an unfinished local write burst and space in its pending-data slot.
+|Write endpoint |`push_data(data, strb, user=0) -> bool` |Queue the next W beat with API-generated WLAST. Return whether it is final.
+|Both endpoints |`can_pop()`, `peek()`, `pop()` |Inspect or consume this endpoint's next buffered result: `ReadBeat(C)` or `WriteCompletion(C)`. Peek does not advance state.
+|===
+
+[[axi4-manager-ordering]]
+=== Ordering and independence
+
+Results within one endpoint follow submission order, as AXI requires for one
+ID. No transaction slots or tokens escape the endpoint.
+
+Different endpoints have independent context queues and no shared retirement
+order. When endpoint B finishes a transaction, B's context becomes free even
+if an older transaction of endpoint A is still unfinished. Responses from
+different endpoints may arrive in any order. For writes, AXI's rule that W
+follows AW order still applies across all endpoints; the Manager handles this
+automatically, but it creates the obligations described in
+<<axi4-manager-progress>>.
+
+Independence is limited by buffering. An endpoint that stops popping can hold
+its responses locally while other endpoints continue, until its response
+buffer is full. After that, its next response waits in the shared R or B
+receive slot and blocks responses for every other endpoint. The API does not
+promise isolation under unlimited stalls.
+
+[[axi4-manager-internals]]
+=== How requests reach the bus
+
+This section describes the current implementation. Application code must not
+depend on its latencies, but they explain the throughput and the progress
+rules below.
+
+----
+ application                       Manager                                    bus
+
+ during api.end():
+ read endpoint 0   push ──► [AR slot] ──┐
+ read endpoint 1   push ──► [AR slot] ──┴──► round robin ──► AR register ──► AR
+
+ write endpoint 0  push ──► [AW slot] ──┐
+ write endpoint 1  push ──► [AW slot] ──┴──► round robin ──► AW register ──► AW
+                                                  │ winner's ID
+                                                  ▼
+                                            W order queue
+                                                  │ head selects the endpoint
+ write endpoint k  push_data ──► [W slot] ────────┴────────► W register ──► W
+
+ during api.begin():
+ endpoint k        pop ◄── [response buffer k] ◄── route by ID ◄── receive slot ◄── R, B
+----
+
+*Pending slots.* Each endpoint has one `Internal` pending-address slot, and
+write endpoints also have one pending-W slot. Pushes fill these slots
+immediately. The slots let endpoint objects accept work independently of the
+physical bus, and they apply backpressure when arbitration or bus stalls
+prevent forwarding.
+
+*Address arbitration.* During `api.end()`, pending requests are moved into the
+shared AR and AW output registers. AR and AW have independent round-robin
+arbiters. Tuple order sets the rotation, starting at endpoint zero after reset.
+Each arbiter first visits endpoints after its previous winner, then makes a
+second full pass from endpoint zero. Both passes use static tuple traversal,
+with no runtime tuple indexing or modulo. Only a successful move into the
+output register updates the winner: idle cycles and a stalled output do not
+rotate priority. An eligible, continuously pending request can therefore be
+bypassed at most once by each other endpoint, provided the output and the
+W order storage make progress. A request in the output register is held there
+through bus stalls and is never replaced. Endpoints can accept new local work in
+the same cycle, regardless of which request wins the bus.
+
+*Write data order.* AXI4 W beats carry no ID, so the Manager records the
+endpoint ID of each AW request in a shared order queue at the moment the
+request moves into the AW output register. The queue's depth is the sum of
+the write endpoints' capacities. Only the endpoint at the head of the order
+queue may move its pending W beat into the shared W output register. Moving
+the final beat advances the queue, independently of B. An endpoint can
+therefore queue data before its AW wins arbitration, but its data cannot
+overtake the actual AW order on the bus. W forwarding does not wait for
+AWREADY. Per-endpoint write-data cursors permit several outstanding writes,
+while each endpoint's B retirement remains local and ordered.
+
+*Response routing.* During `api.begin()`, a received R beat or B response is
+moved to the endpoint whose compile-time ID matches its RID or BID, when that
+endpoint's response buffer has space. A response with an unknown ID is an
+assertion error as soon as it is received. A B response is an assertion error
+once buffered if its burst's final W beat is still in the endpoint's data slot
+or in the W output register. This check derives the beat's location from the
+existing cursor and W order state, so it needs no extra registers. An RLAST
+that does not match the request's length, an EXOKAY response to a
+non-exclusive request, and a B response before the endpoint has supplied all
+of its write data are assertion errors when the application peeks or pops the
+result.
+
+*Latency.* `Internal` slots allow a push followed by a pop in the same cycle.
+A newly submitted request can therefore reach the AR or AW output register
+during the same `api.end()`, and W data can follow a newly arbitrated AW at
+that edge. The extra local storage does not add a forward-latency cycle: the
+first bus transfer can still occur one cycle after the request was pushed, when
+the bus is available. Tests check simultaneous endpoints and immediate
+AR/AW/W forwarding.
+
+[[axi4-manager-progress]]
+=== Avoiding deadlock: the application progress contract
+
+Round-robin arbitration makes address arbitration fair. It cannot prevent
+circular waits that the application creates through the shared W order or
+through shared response buffers. Applications must follow two rules:
+
+* *Supply write data independently.* After submitting a write, eventually
+  supply every beat of that burst. Do not make that data wait for the
+  completion of another write that could follow it in the shared W order. For
+  example, suppose endpoint A's AW wins arbitration first, but A waits for
+  endpoint B's write to complete before producing its data. B cannot complete,
+  because B's W beats must wait for A's. Data may arrive gradually; buffering
+  a complete burst is not required when its producer can progress
+  independently. Note that the order in which the application calls `push`
+  does not determine AW arbitration order across endpoints.
+* *Drain results independently.* Eventually consume R and B results without
+  waiting for another endpoint's completion, if the held results could block
+  that completion. For example, if the application waits for B's read result
+  before consuming A's, A's results can fill A's response buffer and then the
+  shared R receive slot. B's result can then never arrive. Drain results
+  independently, or reserve enough downstream storage to break the dependency
+  before issuing the requests. Larger finite buffers alone do not establish
+  this property for arbitrary traffic.
+
+Connected peers must also eventually service accepted work. The API enforces
+handshake and transaction safety checks, but it cannot verify these
+application-level liveness obligations. The bounded formal checks do not
+prove eventual completion either.
+
+[[axi4-manager-storage]]
+=== Storage cost and examples
+
+The API stores per-transaction descriptors and beat progress, not whole bursts.
+A read context stores only LEN (8 bits), LOCK (1), and beat progress (9),
+or 18 bits per slot before optimization and queue pointers. Write contexts
+retain the address descriptor and beat progress for strobe checking and
+completion; synthesis can remove unused fields. Pending request and data slots
+and response buffers add payload storage. Tuples hold the original endpoints,
+with no runtime linked list or runtime object selection. Selection within a
+multi-entry local FIFO and the shared channel data multiplexers still exist. No
+technology area or timing comparison has been performed yet, so fewer global
+lookups should not be read as a measured area claim.
+
+`AxiCopy` (<<axi4-copy>>) is a complete application that uses one read and
+one write endpoint. `rtl/examples/checks.kh` contains a private application sketch
+with independently configured descriptor and payload read endpoints and a
+write endpoint. Both Python and the LSP check it.

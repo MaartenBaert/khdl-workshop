@@ -1,0 +1,89 @@
+// Ready/valid transactions shared by the encoder and decoder stages.
+// Source drives payload and valid; Sink drives ready. Payload stays stable
+// while valid is asserted and ready is low. Fields flatten to prefix_field
+// in Verilog and Python; block payload structs use packed
+// input_data/output_data ports.
+import reedsolo.[RsDefault];
+
+// A transaction with an explicitly typed forward payload and ready/valid.
+// The payload type carries the field/code and lane-layout identity.
+pub interface RsTransaction(T: type) {
+    data: T,
+    valid: bool,
+    ready: bool,
+    view Source { data: out, valid: out, ready: in }
+    view Sink { data: in, valid: in, ready: out }
+}
+
+// Highest polynomial group first; lane indices increase with coefficient
+// degree within a beat (serial-equivalent order is high lane to low lane).
+// A partial final beat has zeros in its low lanes and symbols in high lanes.
+// Decoded streams also carry the frame's error count and failure status.
+pub interface RsStream(unroll: positive, decoded: bool = false, RS: type = RsDefault) {
+    data: [unroll]RS.Sym,
+    last: bool,
+    if (decoded) {
+        num_errors: uint(0..=RS.t),
+        failed: bool,
+    }
+    valid: bool,
+    ready: bool,
+
+    view Source {
+        data: out,
+        last: out,
+        if (decoded) {
+            num_errors: out,
+            failed: out,
+        }
+        valid: out,
+        ready: in,
+    }
+    view Sink {
+        data: in,
+        last: in,
+        if (decoded) {
+            num_errors: in,
+            failed: in,
+        }
+        valid: in,
+        ready: out,
+    }
+}
+
+// Syndromes of x**padding * C(x), where padding rounds the input codeword to
+// whole stream beats. Chien uses that width. Message symbols bypass the block
+// stages through a packet FIFO, from RsSyndromes to RsCorrection.
+pub struct RsSyndromesBlock(RS: type = RsDefault) {
+    syndromes: [2 * RS.t]RS.Sym,
+}
+
+// Berlekamp-Massey result, including lambda and its degree.
+pub struct RsBerlekampBlock(RS: type = RsDefault) {
+    syndromes: [2 * RS.t]RS.Sym,
+    lambdas: [RS.t + 1]RS.Sym,
+    num_errors: uint(0..=2 * RS.t),
+}
+
+// Chien/omega result with error positions and inverse locations.
+// Lane positions use the search width, independently of Forney's step width.
+// Positions/inverses refer to the padded codeword; cycle (n +/ width)
+// marks an unused error slot.
+pub struct RsChienBlock(unroll_chien: positive, RS: type = RsDefault) {
+    omegas: [RS.t]RS.Sym,
+    lambdas: [RS.t + 1]RS.Sym,
+    error_cpos: [RS.t]uint(RS.m),
+    error_upos: [RS.t]uint(0..unroll_chien),
+    error_xinv: [RS.t]RS.Sym,
+    num_errors: uint(0..=RS.t),
+    failed: bool,
+}
+
+// Forney preserves Chien's cycle/lane layout; correction uses the same width.
+pub struct RsForneyBlock(unroll_chien: positive, RS: type = RsDefault) {
+    error_cpos: [RS.t]uint(RS.m),
+    error_upos: [RS.t]uint(0..unroll_chien),
+    error_val: [RS.t]RS.Sym,
+    num_errors: uint(0..=RS.t),
+    failed: bool,
+}

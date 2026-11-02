@@ -1,0 +1,98 @@
+[[reed-solomon-verification]]
+== Verification and limits
+
+[[reed-solomon-verification-commands]]
+=== Running the checks
+
+From the repository root:
+
+----
+.venv/bin/python -m projects.reed_solomon.tools.compile --check
+.venv/bin/pytest projects/reed_solomon/tests
+.venv/bin/python docs/build.py
+----
+
+`--check` elaborates the concrete `RsEncoder` and `RsDecoder` hierarchies for
+the selected parameters without generating files. It takes the same code and
+parallelism flags as an export, plus `--buffered`. `rtl/reedsolo_checks.kh`
+gives the editor's language server representative default and shortened GF(16)
+specializations in both buffering modes.
+
+[[reed-solomon-verification-tests]]
+=== What the tests cover
+
+The tests are Python benches that compile the KHDL sources, build Verilator
+simulators, and drive them from pytest. `tests/reed_solomon.py` is an unchanged
+copy of the original project's Python reference model. Test vectors are
+generated deterministically during the tests, including all-zero and
+full-scale messages and every correctable error count, with errors injected
+anywhere in the codeword, parity included.
+
+Each original VHDL testbench has a replacement:
+
+[options="header",cols="1,3"]
+|===
+|Original VHDL bench |Python replacement
+|`reedsolo_gf_mul_tb` |`test_gf_mul.py`: every operand pair and every long reduction input, plus generated-table checks.
+|`reedsolo_encoder_tb` |`test_encoder.py`: 1/2/4/8/16 lanes, both flow-control modes, synchronous reset, padded frames, mixed data/parity beats, and latency.
+|`reedsolo_syndromes_tb` |`test_syndromes.py`: 1/8/16 lanes, both modes, malformed-frame recovery.
+|`reedsolo_berlekamp_tb` |`test_berlekamp.py`: 1/2/4 iterations per cycle.
+|`reedsolo_chien_tb` |`test_chien.py`: scalar and unrolled search, including the original 2/16 configuration and root-count failure.
+|`reedsolo_forney_tb` |`test_forney.py`: 1/2/4/16 steps per cycle, failure propagation, and zero denominators.
+|`reedsolo_correction_tb` |`test_correction.py`: scalar and unrolled correction, failed-block passthrough.
+|`reedsolo_decoder_tb` |`test_decoder.py`: 1/4/16 lanes, both modes, a detected uncorrectable frame.
+|`reedsolo_stresstest_tb` |`test_stresstest.py`: 100 frames per independently timed design, 50% input/output stutter, and verified frame overlap.
+|===
+
+Beyond those, `test_parametric.py` compares the elaborated tables with the
+reference model and runs complete encoder/decoder pipelines for alternative
+codes, in both buffering modes, with every correctable error count. It also
+checks that invalid fields and unrolls fail elaboration:
+
+[options="header",cols="1,1,1,1,1,2"]
+|===
+|`n,k` |`m` |`prim` |`alpha,fcr` |Stream lanes |`RsBerlekamp` / `RsChien` evaluator / `RsForney` unroll
+|3,1 |2 |0x7 |2,0 |1 |2 / 1 / 2
+|7,1 |3 |0xb |2,1 |1 |6 / 3 / 6
+|15,13 |4 |0x13 |2,1 |1 |1 / 1 / 1
+|12,6 |4 |0x13 |3,0 |3 |3 / 3 / 4
+|30,20 |5 |0x25 |2,1 |5 |5 / 5 / 7
+|60,48 |8 |0x11b |3,0 |6 |12 / 3 / 12
+|510,500 |9 |0x211 |2,1 |10 |2 / 1 / 3
+|===
+
+Further benches cover low-lane padding across many decoder widths, reset
+during traffic, the error-position types, the round-robin routers, worker
+replication, and the timing models, whose predictions are compared against
+measured cycle counts in simulation.
+
+`test_packet_fifo.py` ports the randomized packet bench of
+https://github.com/MaartenBaert/axi_fifos[axi_fifos] for
+every memory flavor, with and without bypass, at depths 1, 3, and 10: random
+packet sizes, cancelled dummy packets, commits with the last beat or in a
+separate cycle, and independent stutter on both sides. Bypass variants must
+match a cycle-accurate model of a LUT packet FIFO in every cycle, which also
+makes them equivalent to each other. Non-bypass variants must deliver the same
+transactions. Directed tests check commit-to-output latency, full-rate
+streaming, reset, and a struct payload.
+
+The ready/valid drivers sample handshakes before each rising edge and hold
+input payloads until they are accepted. They check that stalled outputs stay
+stable, assert framing and error status, and bound every run to detect
+deadlocks. The stress bench streams messages through the encoder, corrupts the
+captured codewords, and streams them through the decoder under a separate
+random schedule. It never waits for one frame's output before supplying the
+next, and asserts that at least two encoder frames and three decoder frames
+overlap.
+
+[[reed-solomon-verification-limits]]
+=== What has not been established
+
+* FPGA or ASIC synthesis, resource use, and achievable clock frequency have not
+  been measured. Cycle counts do not predict clock frequency: unrolling shortens
+  the cycle count but lengthens combinational paths.
+* The decoder's two justified `assert_assume` sites lower to simulation
+  `$finish` tasks, which Yosys rejects (https://github.com/khdl-lang/khdl/issues/36[khdl#36]). Direct synthesis of the decoder export needs a
+  compiler fix first. The encoder export contains no such tasks.
+* The timing diagrams in this manual show protocol examples, not measured
+  propagation delays.

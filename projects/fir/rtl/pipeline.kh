@@ -1,0 +1,75 @@
+import streams.[Stream, receiver, transmitter, internal];
+
+pub fn stage_counts(total: positive, partition: any) -> any {
+    var counts;
+    if (partition.len == 0) { counts = [1] * total; }
+    else { counts = [item for item in partition]; }
+    var sum = 0;
+    for (count in counts) {
+        assert(count > 0, "Pipeline stage sizes must be positive"); sum += count;
+    }
+    assert(sum == total, "Pipeline stage sizes must sum to the number of algorithm steps");
+    return counts;
+}
+pub fn positions(counts: any) -> any {
+    var result = [0] * (counts.len + 1);
+    for (i in 0..counts.len) { result[i + 1] = result[i] + counts[i]; }
+    return result;
+}
+
+// Functions and types are compile-time arrays. Each function allocates its own
+// algorithmic registers at its one canonical call site, even while inactive.
+// Grouping only chooses which functions share elastic register boundaries.
+pub module Group(C: type, types: any, functions: any, first: uint, count: positive) ports(
+    clk: in clock,
+    sync(clk) {
+        rst: in bool,
+        input: interface Stream(types[first]).Sink,
+        output: interface Stream(types[first + count]).Source,
+        coefficients: in C.Coefficients,
+        clear_event: in bool, flushing: in bool,
+        clear_queued: out bool,
+    }
+) {
+    const prefix = first < C.decode_first;
+    const frontier = prefix && first + count >= C.decode_first;
+    clocked(clk, sync rst) {
+        val rx = receiver(types[first], ref(input));
+        val tx = transmitter(types[first + count], ref(output));
+        val queue = internal(types[first + count]);
+        reg r_marker: bool = false;
+        reg wire clear_queued = true;
+        rx.begin(); queue.begin(); tx.begin();
+        if (clear_event && frontier) { r_marker = true; }
+
+        // Coefficient-dependent partials are discarded by consuming queues.
+        // Safe completed products remain ordered ahead of the clear marker.
+        if (queue.can_pop()) {
+            if (prefix && !frontier && flushing) { val _ = queue.pop(); }
+            else if (tx.can_push()) { tx.push(queue.pop()); }
+        }
+        var work = false;
+        var value: types[first] = undef;
+        value.clear = false;
+        if (prefix && flushing) {
+            if (rx.can_pop()) { val _ = rx.pop(); }
+        } else if (!r_marker && rx.can_pop() && queue.can_push()) {
+            value = rx.pop(); work = true;
+        }
+        val clear = (clear_event && prefix) || (work && value.clear);
+        // Untyped value can change hardware type at each statically selected
+        // call. Preserve the input's type declaration only on the source slot.
+        var result = value;
+        for (i in first..first + count) {
+            result = functions[i](work, clear, result, coefficients);
+        }
+        if (work) { queue.push(result); }
+        if (frontier && r_marker && queue.can_push()) {
+            var marker: types[first + count] = undef;
+            marker.clear = true;
+            queue.push(marker); r_marker = false;
+        }
+        clear_queued = !r_marker;
+        tx.end(); queue.end(); rx.end();
+    }
+}

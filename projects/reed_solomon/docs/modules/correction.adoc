@@ -1,0 +1,75 @@
+[[reed-solomon-correction]]
+=== RsCorrection
+
+Source: `rtl/reedsolo_correction.kh`.
+
+==== Function and interfaces
+
+`RsCorrection` takes a block with the error positions and magnitudes, reads the
+received message beats from its `message` input, applies XOR corrections to
+message positions, and streams the message in the common highest-group-first
+order. The inverse butterfly routes the queued slots from `RsChien`
+back to their original lanes. Parity errors contribute to status
+but their parity symbols are not emitted.
+
+`input` is `RsTransaction(RsForneyBlock(U, RS=RS)).Sink`. `message` is
+`RsTransaction([U]RS.Sym).Sink`, delivering the frame's first `K` codeword beats
+as `RsSyndromes` forwards them (<<reed-solomon-message-path>>). `output` is
+`RsStream(U, decoded=true, RS=RS).Source`, with
+`K=(k +/ U)` message beats. `last` identifies the final message beat.
+`num_errors` and `failed` repeat unchanged on every beat, including stalled
+beats. On `failed`, the received message is passed through without XOR
+corrections; final padding is still zeroed.
+
+[cols="1,1,3",options="header"]
+|===
+|Parameter |Default |Effect / constraint
+|RS |RsDefault |Code and field configuration.
+|unroll |1 |Any positive `U`; output lanes and incoming error-position lane width.
+|===
+
+==== Positions, timing, and buffering
+
+With `C=(n +/ U)`, the message groups use search cycles from `RsChien`
+`C-1, C-2, ..., C-K`. Lane indices already match the stream. The last
+message group may contain parity symbols and parity error positions in its
+low lanes; those lanes are cleared *after* correction, so a message shorter
+than one beat is supported.
+
+When its output register is free and a message beat is available, the module
+assembles the first message beat on the same edge that accepts the input
+block. First output transfer is possible one cycle later. Each output beat
+consumes one message beat; a missing message beat pauses the output. It emits one beat per clock when ready stays
+high, giving last transfer `K` cycles after block acceptance. The working
+block is released as soon as the last beat is placed in the output register,
+even if that beat has not yet transferred.
+
+.One block accepted at edge zero produces two message transfers; status is held with each beat.
+[wavedrom]
+....
+{"signal":[
+  {"name":"clk","wave":"p..."},
+  {"name":"input.valid","wave":"10.."},
+  {"name":"input.ready","wave":"101."},
+  {"name":"output.valid","wave":"01.0"},
+  {"name":"output.ready","wave":"1..."},
+  {"name":"output.data","wave":"x23x","data":["d3..d6","0,d0..d2"]},
+  {"name":"output.last","wave":"0.10"},
+  {"name":"num_errors / failed","wave":"x2.x","data":["frame status"]}
+],"head":{"text":"RsCorrection: RS(13,7), U=4","tick":0},"config":{"hscale":3}}
+....
+
+There is a working block plus one registered output beat. The next block
+can be accepted while the previous frame's final output beat is stalled,
+but its output waits until that register becomes free. With no stalls,
+successive block acceptances can be `K` cycles apart. Backpressure freezes
+correction progress, and message consumption, whenever the output register is
+occupied. `input.ready` is registered and reflects working-block capacity, not
+downstream `ready` directly; `message.ready` follows `output.ready`
+combinationally.
+
+The incoming error slots must preserve the butterfly layout from `RsChien`
+carried through `RsForney`. Sentinel positions must stay out of the valid
+search-cycle range; an arbitrary list of sorted errors is not a compatible
+replacement. The stage performs no decoding validation beyond honoring
+the incoming `failed` flag.

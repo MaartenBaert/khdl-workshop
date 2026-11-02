@@ -1,0 +1,59 @@
+// Concrete roots for both Python's lazy compiler and the LSP. Keep behavioral
+// checks in tests; these roots establish parameter/type/domain compatibility.
+import axi.types.[axi_config, AxiDefault, read_request, write_request];
+import axi.interfaces.Axi;
+import axi.manager.[manager, read_endpoint, write_endpoint];
+import examples.pipeline.AxiPipeline;
+import examples.ram.AxiRam;
+import examples.error.AxiError;
+import examples.router.AxiRouter;
+import examples.copy.AxiCopy;
+
+pub fn check_examples() {
+    for (width in [8, 32, 64, 1024]) {
+        val C = axi_config(addr_width=16, data_width=width);
+        AxiPipeline(C);
+        AxiRam(C, memory_bytes=128, capacity=1);
+        AxiError(C, capacity=3);
+        AxiCopy(C);
+        EndpointManagerCheck(C);
+        AxiRouter(C, capacity=3);
+    }
+    val C = axi_config(
+        addr_width=32,
+        data_width=32,
+        id_width=0,
+        awuser_width=1,
+        wuser_width=2,
+        buser_width=3,
+        aruser_width=4,
+        ruser_width=5,
+    );
+    AxiPipeline(C); AxiRam(C, memory_bytes=128, capacity=3);
+    AxiRouter(C, capacity=1);
+}
+
+const { check_examples(); }
+
+// A small application sketch exercises heterogeneous endpoint types in the
+// ordinary manifest/LSP roots, rather than only in injected verification code.
+module EndpointManagerCheck(C: type = AxiDefault) ports(
+    clk: in clock, rst: in async bool,
+    bus: interface sync(clk, async rst) Axi(C).Manager,
+) {
+    clocked(clk, async rst) {
+        val descriptors = read_endpoint(C, id=0);
+        val payloads = read_endpoint(C, id=1, capacity=3, response_depth=2);
+        val writes = write_endpoint(C, id=1, capacity=2);
+        val api = manager(C, ref(bus), reads=(descriptors, payloads), writes=(writes,));
+        api.begin();
+        if (descriptors.can_push()) { descriptors.push(read_request(C, 0)); }
+        if (payloads.can_push()) { payloads.push(read_request(C, 0, beats=2)); }
+        if (writes.can_push()) { writes.push(write_request(C, 0)); }
+        if (descriptors.can_pop()) { val _ = descriptors.pop(); }
+        if (payloads.can_pop()) { val _ = payloads.pop(); }
+        if (writes.can_push_data()) { val _ = writes.push_data(0, 2**C.bytes - 1); }
+        if (writes.can_pop()) { val _ = writes.pop(); }
+        api.end();
+    }
+}

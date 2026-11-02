@@ -1,0 +1,78 @@
+// Ordered bounded transaction contexts. Values returned to callers are slot
+// tokens, not references into arrays. References to API-created registers keep
+// storage alive across factory returns without creating hardware pointers.
+pub struct ContextMatch(capacity: positive) { found: bool, token: uint(0..capacity) }
+
+pub struct ContextQueue(D: type, capacity: positive) {
+    ref descriptors: [capacity]D,
+    ref beats: [capacity]uint(0..257),
+    ref head: uint(0..capacity),
+    ref tail: uint(0..capacity),
+    ref level: uint(0..=capacity),
+
+    fn can_push(self) -> bool { return self.level < capacity; }
+    fn can_pop(self) -> bool { return self.level > 0; }
+    fn contains(self, token: uint(0..capacity)) -> bool {
+        var distance = token - self.head;
+        if (token < self.head) { distance = token + capacity - self.head; }
+        return distance >= 0 && distance < self.level;
+    }
+    fn only_id(self, id: any) -> bool {
+        var same = true;
+        for (offset in 0..capacity) {
+            var index = self.head + offset;
+            if (index >= capacity) { index = index - capacity; }
+            if (offset < self.level && self.descriptors[index].id != id) { same = false; }
+        }
+        return same;
+    }
+    // Address descriptors carry an AXI ID. Scan in acceptance order so two
+    // active contexts with the same ID always match the older one first.
+    fn find_id(self, id: any, done: Ref([capacity]bool)) -> ContextMatch(capacity) {
+        var result = ContextMatch(capacity).new(found=false, token=0);
+        for (offset in 0..capacity) {
+            var index = self.head + offset;
+            if (index >= capacity) { index = index - capacity; }
+            if (offset < self.level && !result.found) {
+                if (!deref(done)[index] && self.descriptors[index].id == id) {
+                    result = ContextMatch(capacity).new(found=true, token=index);
+                }
+            }
+        }
+        return result;
+    }
+    fn push(self, descriptor: D) -> uint(0..capacity) {
+        val available = self.can_push();
+        assert(available, "ContextQueue.push(): capacity required");
+        val token = self.tail;
+        if (available && self.level < capacity) {
+            self.descriptors[token] = descriptor;
+            self.beats[token] = 0;
+            if (self.tail == capacity - 1) { self.tail = 0; }
+            else { self.tail = self.tail + 1; }
+            self.level = self.level + 1;
+        }
+        return token;
+    }
+    fn pop(self) {
+        val available = self.can_pop();
+        assert(available, "ContextQueue.pop(): context required");
+        if (available && self.level > 0) {
+            if (self.head == capacity - 1) { self.head = 0; }
+            else { self.head = self.head + 1; }
+            self.level = self.level - 1;
+        }
+    }
+}
+
+pub fn context_queue(D: type, capacity: positive) -> ContextQueue(D, capacity) {
+    reg r_descriptors: [capacity]D = undef;
+    reg r_beats: [capacity]uint(0..257) = undef;
+    reg r_head: uint(0..capacity) = 0;
+    reg r_tail: uint(0..capacity) = 0;
+    reg r_level: uint(0..=capacity) = 0;
+    return ContextQueue(D, capacity).new(
+        descriptors=ref(r_descriptors), beats=ref(r_beats),
+        head=ref(r_head), tail=ref(r_tail), level=ref(r_level),
+    );
+}

@@ -1,0 +1,9 @@
+.venv/
+build/
+__pycache__/
+.pytest_cache/
+
+/plans/
+.vscode/
+AGENTS.local.md
+/notes/

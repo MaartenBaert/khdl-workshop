@@ -1,0 +1,29 @@
+import axi.interfaces.[Axi, manager_channels, subordinate_channels];
+import axi.types.AxiDefault;
+
+fn forward(input: any, output: any) {
+    if (input.can_pop() && output.can_push()) { output.push(input.pop()); }
+}
+
+// Registered on every channel, including reverse responses. Transport does not
+// reconstruct bursts, so IDs, attributes and all USER bits pass through intact.
+pub module AxiPipeline(C: type = AxiDefault) ports(
+    clk: in clock,
+    rst: in async bool,
+    sync(clk, async rst) {
+        input: interface Axi(C).Subordinate,
+        output: interface Axi(C).Manager,
+    }
+) {
+    clocked(clk, async rst) {
+        val upstream = subordinate_channels(C, ref(input));
+        val downstream = manager_channels(C, ref(output));
+        upstream.begin(); downstream.begin();
+        forward(upstream.aw, downstream.aw);
+        forward(upstream.w, downstream.w);
+        forward(downstream.b, upstream.b);
+        forward(upstream.ar, downstream.ar);
+        forward(downstream.r, upstream.r);
+        downstream.end(); upstream.end();
+    }
+}

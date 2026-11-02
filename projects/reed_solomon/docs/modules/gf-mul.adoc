@@ -1,0 +1,39 @@
+[[reed-solomon-gf-mul]]
+=== RsGfMul arithmetic test wrapper
+
+Source: `rtl/reedsolo_gf_mul.kh`. This private module exposes the GF
+helpers as combinational ports for exhaustive arithmetic simulation.
+`RsEncoder` and `RsDecoder` call `RS` helpers directly; they do not
+instantiate this wrapper.
+
+Its only parameter is `RS: type = RsDefault`. All ports are asynchronous
+combinational values; there is no clock, reset, valid, ready, or padding.
+
+[cols="1,1,1,3",options="header"]
+|===
+|Port |Direction |Width |Meaning
+|a, b |in |m each |Polynomial-basis field elements.
+|long_value |in |2*m-1 |Unreduced polynomial to reduce.
+|product |out |m |`RS.gf_mul(a,b)`.
+|long_product |out |2*m-1 |`RS.gf_mul_long(a,b)`, before reduction.
+|reduced |out |m |`RS.gf_reduce(long_value)`.
+|===
+
+Bit `i` represents the coefficient of `x**i` in each port. Outputs follow
+combinationally after inputs settle, with zero registered cycles of latency.
+This diagram shows settled intervals, not physical propagation delays:
+
+[wavedrom]
+....
+{"signal":[
+  {"name":"a / b","wave":"2.3.4.","data":["A0 / B0","A1 / B1","A2 / B2"]},
+  {"name":"product","wave":"2.3.4.","data":["mul(A0,B0)","mul(A1,B1)","mul(A2,B2)"]},
+  {"name":"long_product","wave":"2.3.4.","data":["raw(A0,B0)","raw(A1,B1)","raw(A2,B2)"]},
+  {"name":"long_value","wave":"2.3.4.","data":["L0","L1","L2"]},
+  {"name":"reduced","wave":"2.3.4.","data":["reduce(L0)","reduce(L1)","reduce(L2)"]}
+],"head":{"text":"RsGfMul: combinational settled values"},"config":{"hscale":3}}
+....
+
+Python `resolve` can access the private wrapper for verification; it is not
+a public cross-file import API. For integration, use `RS.gf_mul` and the
+related helpers documented in <<reed-solomon-configuration>>.

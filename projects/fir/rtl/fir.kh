@@ -1,0 +1,98 @@
+import types.[fir_config, InputPacket, OutputPacket, packet_type];
+import transforms.encode_group;
+import steps.make_step;
+import streams.[Stream, receiver, transmitter];
+import pipeline.[Group, stage_counts, positions];
+
+pub module Fir(
+    input_w: positive = 16, input_f: uint = 15,
+    output_w: positive = 16, output_f: uint = 15,
+    coeff_w: positive = 16, coeff_f: uint = 15,
+    taps: positive = 16, parallel: positive = 4, ffa_depth: uint = 2,
+    taps_per_stage: positive = 4, pipeline_steps: any = (),
+) ports(
+    clk: in clock,
+    sync(clk) {
+        rst: in bool,
+        input: interface Stream([parallel]int(input_w)).Sink,
+        output: interface Stream([parallel]int(output_w), true).Source,
+        coeff_value: in int(coeff_w), coeff_push: in bool, coeff_clear: in bool,
+    }
+) {
+    type C = fir_config(input_w, input_f, output_w, output_f, coeff_w, coeff_f,
+        taps, parallel, ffa_depth, taps_per_stage);
+    const functions = [make_step(C, i) for i in 0..C.steps];
+    const types = [packet_type(C, i) for i in 0..C.steps + 1];
+    const counts = stage_counts(C.steps, pipeline_steps);
+    const starts = positions(counts);
+    wire coefficients: sync(clk) C.Coefficients;
+    wire flushing: sync(clk) bool;
+    wire flush_cycles: sync(clk) uint(0..4);
+    wire boundary_ready: bool;
+    for (i in 0..counts.len + 1) {
+        pub wire ident("link_{i}"): interface Stream(types[starts[i]]);
+    }
+    for (i in 0..counts.len) {
+        wire queued: bool;
+        instance Group(C, types, functions, starts[i], counts[i]) ports(
+            clk, rst, input=ident("link_{i}"), output=ident("link_{i + 1}"),
+            coefficients, clear_event=coeff_clear, flushing, clear_queued=queued,
+        );
+        if (starts[i] < C.decode_first && starts[i + 1] >= C.decode_first) {
+            comb { boundary_ready = queued; }
+        }
+    }
+    comb { flushing = coeff_clear || flush_cycles > 0; }
+    clocked(clk, sync rst) {
+        reg wire coefficients = undef;
+        reg r_group: [C.radix]C.Coeff = [0] * C.radix;
+        reg r_fill: uint(0..C.radix) = 0;
+        reg r_loaded: uint(0..=C.taps) = 0;
+        reg r_ready: bool = false;
+        reg wire flush_cycles = 0;
+        val rx = receiver([parallel]C.Input, ref(input), false);
+        val source = transmitter(InputPacket(C), ref(link_0));
+        val sink = receiver(OutputPacket(C), ref(ident("link_{counts.len}")));
+        val tx = transmitter([parallel]C.Output, ref(output));
+        reg wire output.clipped = false;
+        rx.begin(); source.begin(); sink.begin(); tx.begin();
+        val accept = r_ready && !flushing && boundary_ready;
+        rx.set_enabled(accept);
+        if (sink.can_pop()) {
+            val packet = sink.peek();
+            if (packet.clear) { val _ = sink.pop(); }
+            else if (tx.can_push()) {
+                val _ = sink.pop(); tx.push(packet.samples); output.clipped = packet.clipped;
+            }
+        }
+        if (flushing) { if (rx.can_pop()) { val _ = rx.pop(); } }
+        else if (accept && rx.can_pop() && source.can_push()) {
+            source.push(InputPacket(C).new(clear=false, samples=rx.pop()));
+        }
+
+        if (coeff_clear) {
+            r_group = [0] * C.radix; r_fill = 0; r_loaded = 0; r_ready = false;
+            flush_cycles = 3;
+        } else if (flush_cycles > 0) { flush_cycles -= 1; }
+        // Clear-then-push includes the same cycle's h[0]. Every stored leaf
+        // coefficient is overwritten before r_ready permits any filtering.
+        if (coeff_push) {
+            assert(!r_ready, "coeff_clear required before replacing coefficients");
+            if (!r_ready && r_loaded < C.taps) {
+                r_group[r_fill] = coeff_value;
+                r_loaded += 1;
+                if (r_fill == C.radix - 1 || r_loaded == C.taps) {
+                    val encoded = encode_group(C, r_group);
+                    for (b in 0..C.leaves) {
+                        coefficients[b] = [encoded[b], *coefficients[b][0..C.leaf_taps - 1]];
+                    }
+                    // The next group starts zero-filled. Consequently padding
+                    // the final short group needs neither a mask nor extra cycles.
+                    r_group = [0] * C.radix; r_fill = 0;
+                } else { r_fill += 1; }
+                if (r_loaded == C.taps) { r_ready = true; }
+            }
+        }
+        tx.end(); sink.end(); source.end(); rx.end();
+    }
+}

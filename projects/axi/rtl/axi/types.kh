@@ -1,0 +1,83 @@
+// AXI4 wire payloads. Address and data channels retain their own USER widths.
+// Raw encoded fields stay representable so monitors can diagnose illegal peers.
+pub fn axi_config(
+    addr_width: positive = 32, data_width: positive = 32, id_width: uint = 4,
+    awuser_width: uint = 0, wuser_width: uint = 0, buser_width: uint = 0,
+    aruser_width: uint = 0, ruser_width: uint = 0,
+) -> type {
+    assert(data_width >= 8 && data_width <= 1024, "AXI4 data width must be 8..1024");
+    assert(2**clog2(data_width) == data_width, "AXI4 data width must be a power of two");
+    struct Config {
+        const addr_width = addr_width;
+        const data_width = data_width;
+        const id_width = id_width;
+        const bytes = data_width / 8;
+        const size = clog2(bytes);
+        const awuser_width = awuser_width;
+        const wuser_width = wuser_width;
+        const buser_width = buser_width;
+        const aruser_width = aruser_width;
+        const ruser_width = ruser_width;
+        type Addr = uint(addr_width);
+        type Data = uint(data_width);
+        type Id = uint(id_width);
+        type Strobe = uint(bytes);
+        type Aw = address_payload(addr_width, id_width, awuser_width);
+        type Ar = address_payload(addr_width, id_width, aruser_width);
+        type W = write_payload(data_width, wuser_width);
+        type B = write_response(id_width, buser_width);
+        type R = read_payload(data_width, id_width, ruser_width);
+        const fixed = 0;
+        const incr = 1;
+        const wrap = 2;
+        const okay = 0;
+        const exokay = 1;
+        const slverr = 2;
+        const decerr = 3;
+    }
+    return Config;
+}
+
+fn address_payload(addr_width: positive, id_width: uint, user_width: uint) -> type {
+    struct Address {
+        id: uint(id_width), addr: uint(addr_width), len: uint(8),
+        size: uint(3), burst: uint(2), lock: bool, cache: uint(4),
+        prot: uint(3), qos: uint(4), region: uint(4), user: uint(user_width),
+    }
+    return Address;
+}
+
+fn write_payload(data_width: positive, user_width: uint) -> type {
+    struct Write { data: uint(data_width), strb: uint(data_width / 8), last: bool, user: uint(user_width) }
+    return Write;
+}
+
+fn write_response(id_width: uint, user_width: uint) -> type {
+    struct Response { id: uint(id_width), resp: uint(2), user: uint(user_width) }
+    return Response;
+}
+
+fn read_payload(data_width: positive, id_width: uint, user_width: uint) -> type {
+    struct Read { id: uint(id_width), data: uint(data_width), resp: uint(2), last: bool, user: uint(user_width) }
+    return Read;
+}
+
+pub type AxiDefault = axi_config();
+
+// Application-facing constructors use a beat count rather than AXI's LEN=count-1.
+// Manager submission validates burst/address combinations before issuing them.
+pub fn read_request(C: type, addr: C.Addr, beats: uint(1..257) = 1,
+    id: C.Id = 0, size: uint(3) = C.size, burst: uint(2) = C.incr, lock: bool = false,
+    cache: uint(4) = 0, prot: uint(3) = 0, qos: uint(4) = 0, region: uint(4) = 0,
+    user: uint(C.aruser_width) = 0) -> C.Ar {
+    return C.Ar.new(id=id, addr=addr, len=beats - 1, size=size, burst=burst,
+        lock=lock, cache=cache, prot=prot, qos=qos, region=region, user=user);
+}
+
+pub fn write_request(C: type, addr: C.Addr, beats: uint(1..257) = 1,
+    id: C.Id = 0, size: uint(3) = C.size, burst: uint(2) = C.incr, lock: bool = false,
+    cache: uint(4) = 0, prot: uint(3) = 0, qos: uint(4) = 0, region: uint(4) = 0,
+    user: uint(C.awuser_width) = 0) -> C.Aw {
+    return C.Aw.new(id=id, addr=addr, len=beats - 1, size=size, burst=burst,
+        lock=lock, cache=cache, prot=prot, qos=qos, region=region, user=user);
+}

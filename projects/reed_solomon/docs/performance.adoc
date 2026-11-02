@@ -1,0 +1,270 @@
+[[reed-solomon-performance]]
+== Timing models and parallelism selection
+
+Source: `rtl/reedsolo_performance.kh`.
+
+This chapter gives each module's latency and throughput as formulas, and
+describes elaboration-time functions that compute them and select the
+cheapest configuration for a target. The functions add no hardware. Choosing
+`RsEncoder.unroll` and `RsDecoder.parallelism` by hand remains equally valid.
+
+=== Definitions and module formulas
+
+*Latency* is the number of cycles from the first input transfer to the first
+output transfer of the same frame, starting with an empty pipeline.
+Latencies add when stages are cascaded. *Frame interval* is sustained cycles
+per frame; smaller values mean higher throughput. All formulas assume
+continuously available, correctly framed input and an always-ready consumer.
+Input gaps, output stalls, and waiting behind older frames can increase latency.
+The decoder formulas assume the default message buffer, which never limits
+the pipeline (<<reed-solomon-decoder-message-buffer>>).
+`buffered` does not change these ideal timing metrics.
+
+Define:
+
+----
+R = n-k = 2*t
+U = stream/search width
+C = (n +/ U)
+K = (k +/ U)
+B = R/U_B
+O = t/U_O
+H = max(C,O)
+A = (t +/ 2)-fcr+t+2
+F = (A +/ U_F)
+----
+
+`U_B`, `U_O`, and `U_F` are the Berlekamp, omega, and Forney arithmetic
+unrolls. `N_B` and `N_F` are their frame-parallel worker counts. Legal widths
+and divisibility restrictions are in <<reed-solomon-unroll-constraints>>.
+
+[cols="2,1,2,3",options="header"]
+|===
+|Module |Latency |Cycles/frame |Reason
+|RsEncoder |1 |C |Registered forwarding; each frame occupies C output beats.
+|RsSyndromes |C |C |C input beats, then one block transaction.
+|RsBerlekamp |B |max(1,B/N_B) |B serial iteration groups per worker, N_B workers.
+|RsChien |H |H |Search and omega calculation overlap; both must finish.
+|RsForney |F |max(1,F/N_F) |F serial arithmetic groups per worker, N_F workers.
+|RsCorrection |1 |K |Registered first beat; K message beats per frame.
+|RsRoundRobinDispatch / RsRoundRobinCollect |0 |1 |Combinational routing; one block transfer per cycle.
+|RsDecoder |C+B+H+F+1 |max(H,B/N_B,F/N_F) |Sum of stage latencies; bottleneck stage determines sustained rate.
+|===
+
+The standalone `RsBerlekamp` and `RsForney` modules have one worker. Their
+model functions accept an optional `instances` argument to describe a routed
+bank. Replication divides service demand, but does not divide latency.
+`H>=C>=K>=1`, so the decoder interval already includes input, output, and
+router bandwidth limits. Its last output transfer occurs `K-1` cycles after
+its first in the unstalled isolated-frame case. Similarly, `RsEncoder`'s
+last output is C cycles after its first input; this is not its latency.
+`RsGfMul` is a combinational arithmetic verification wrapper, with no frame
+protocol or frame interval.
+
+The interval follows from stage reuse: input frames need C cycles, each
+Berlekamp worker is reused after B cycles, `RsChien` after H, each Forney
+worker after F, and correction after K. The round-robin banks process equal
+fixed-duration work in input order. No later worker finishes before an
+earlier worker solely because of computation time. Their counters add no
+clock boundary. Replicated banks can emit unequal gaps even in continuous
+traffic; cycles/frame describes the long-run average, not a maximum gap.
+
+For RS(13,7), `U=13`, `U_B=3`, `U_O=3`, `U_F=1`, `N_B=1`, `N_F=2`,
+we have `C=H=K=1`, `B=2`, and `F=7`. First output is at cycle 12;
+outputs follow at `12,14,19,21,26,28,...`. Gaps alternate between 2 and 5,
+so the sustained interval is `7/2` cycles/frame. The model gives this long-run
+average, not a maximum gap between consecutive frames.
+
+At clock frequency f, information throughput is `k*m*f / interval` bits/s;
+encoded throughput is `n*m*f / interval`. Clock period is an external
+technology assumption: these formulas do not predict synthesis timing.
+
+=== Exact timing values
+
+`RsFrameInterval` stores positive integer `cycles` and `frames`.
+`frame_interval(cycles, frames=1)` reduces the ratio, so `frame_interval(4)`
+means four cycles/frame and `frame_interval(7,2)` means 3.5 cycles/frame.
+`RsTiming` contains `latency` and `interval`. Ratios are compared by integer
+cross-products, with no floating-point rounding.
+
+[cols="2,3",options="header"]
+|===
+|Function |Arguments
+|encoder_timing / syndromes_timing / correction_timing |RS=RsDefault, unroll=1
+|berlekamp_timing / forney_timing |RS=RsDefault, unroll=1, instances=1
+|chien_timing |RS=RsDefault, unroll_chien=1, unroll_omegas=1
+|decoder_timing |RS, parallelism
+|round_robin_timing |No arguments; either combinational router.
+|===
+
+Arithmetic timing functions reject illegal unrolls using the same constraints
+as the RTL. Arbitrarily wide stream/search widths remain supported by the
+models, even though selection never benefits from choosing U>n.
+
+=== Selecting an encoder width
+
+`select_encoder_unroll(RS, max_latency, max_cycles_per_frame)` returns the
+smallest positive width meeting both requirements. Latency must permit at
+least one cycle. Let `I=floor(max_cycles_per_frame)`; since encoder interval
+is integral, the answer is `(n +/ I)`. An interval below one cycle/frame
+is impossible and fails elaboration. No technology cost coefficients are
+needed: the helper chooses the smallest qualifying width.
+
+=== Selecting decoder parallelism
+
+`select_decoder_parallelism(RS, max_unroll_berlekamp, max_unroll_forney, costs,
+max_latency, max_cycles_per_frame)` returns an `RsDecoderParallelism`.
+It minimizes estimated cost among configurations meeting both timing limits.
+Unroll caps are positive upper bounds; Berlekamp still must divide R, omega
+must divide t, and Forney unroll cannot exceed R.
+
+`RsLinearCost.new(a=..., b=...)` represents per-instance cost `a*unroll+b`.
+`RsChienCost.new(a_search=..., a_omegas=..., b=...)` represents
+`a_search*U+a_omegas*U_O+b`, since `RsChien` has two independent unrolls.
+`RsDecoderCosts` contains `syndromes`, `berlekamp`, `chien`, `forney`, and
+`correction`. All coefficients are nonnegative integers; scale fractional
+technology weights by a common denominator. Worker cost is multiplied by
+worker count. `decoder_cost(parallelism,costs)` returns the summed estimate.
+Routing cost is not modeled separately. The model is a selection policy,
+not a synthesized area prediction; calibrate coefficients for the chosen
+field, implementation technology, and clock target.
+
+For a candidate with B and F cycles and target interval I, the cheapest
+qualifying counts are `N_B=max(1,ceil(B/I))` and `N_F=max(1,ceil(F/I))`.
+The helper searches legal arithmetic unrolls and distinct stream beat counts.
+For equal C, larger U has identical timing and no lower linear cost, so only
+the smallest width is needed. U>n also adds cost without improving timing.
+This finite search covers every potentially cheaper solution under the model.
+If no candidate meets the requirements, the helper fails elaboration with a
+timing/cap diagnostic.
+
+Equal-cost candidates retain the first in ascending stream, omega, Berlekamp,
+and Forney unroll order, with the minimum qualifying counts. Zero coefficients
+are permitted and use the same deterministic tie rule. The helper does not
+choose `buffered`, which remains a separate flow-control decision.
+
+.Example: serial arithmetic, up to 22 cycles latency, at most four cycles/frame.
+----
+import reedsolo.[rs_config];
+import reedsolo_decoder.[RsDecoder];
+import reedsolo_performance.[RsLinearCost, RsChienCost, RsDecoderCosts,
+    frame_interval, select_encoder_unroll, select_decoder_parallelism,
+    decoder_timing];
+
+type RS = rs_config(n=13, k=7, m=4, prim=0x13, alpha=3, fcr=0);
+const unit = RsLinearCost.new(a=1, b=1);
+const costs = RsDecoderCosts.new(
+    syndromes=unit, berlekamp=unit,
+    chien=RsChienCost.new(a_search=1, a_omegas=1, b=1),
+    forney=unit, correction=unit,
+);
+const encoder_width = select_encoder_unroll(
+    RS, max_latency=1, max_cycles_per_frame=frame_interval(4),
+);
+const plan = select_decoder_parallelism(
+    RS, max_unroll_berlekamp=1, max_unroll_forney=1, costs=costs,
+    max_latency=22, max_cycles_per_frame=frame_interval(4),
+);
+const predicted = decoder_timing(RS, plan);
+// Inside a module with the corresponding stream interfaces:
+// instance RsDecoder(RS=RS, parallelism=plan) ports(clk, rst, input, output);
+----
+
+Here `encoder_width=4`; the decoder chooses stream width 4, unit arithmetic
+unrolls, and two workers each for `RsBerlekamp` and `RsForney`. Predicted
+latency is 22 cycles and interval is four cycles/frame. These unit weights
+illustrate the API; supply technology-dependent weights for real selection.
+
+[[reed-solomon-message-buffer-selection]]
+=== Selecting a message buffer
+
+`select_message_buffer(RS, parallelism, max_cycles_per_frame,
+memory=RsFifoMemory.Lut, bypass=true)` returns the smallest whole-frame
+`RsMessageBuffer` with which the decoder sustains one frame per
+`max_cycles_per_frame` cycles. Frames can arrive at that rate, or the source
+can be faster and the buffer throttles it. For a target of `I` cycles/frame,
+it returns
+
+----
+depth = ceil((L-1)/I) * K
+----
+
+where `L` is the decoder latency and `K` the message beats per frame. The
+depth depends only on the latency, the target, and the message frame size,
+not on the worker counts. A target faster than the decoder's own interval `P`
+fails elaboration.
+
+==== Derivation
+
+The derivation assumes that each frame's input beats are accepted on
+consecutive cycles once its first beat is, and that the sink is always ready.
+Let `s_f` be the cycle of frame `f`'s first input transfer.
+
+. *Slot reuse.* `RsSyndromes` pushes message beat `j` of frame `f` in cycle
+  `s_f + 1 + j`, one cycle after its input transfer. `RsCorrection` pops it in
+  cycle `s_f + L - 1 + j`, when it loads the output register for the output
+  transfer in cycle `s_f + L + j`. A full buffer cannot accept a beat in the
+  cycle it pops one, so the freed entry takes a new beat from cycle
+  `s_f + L + j` on. A frame `g` that reuses frame `f`'s entries pushes its beat
+  `j` in cycle `s_g + 1 + j`, so it needs
++
+----
+s_g >= s_f + L - 1
+----
++
+The same holds for every beat `j`, so a whole frame of space is free again
+exactly `L-1` cycles after the frame that held it started.
+
+. *Throughput.* With room for `m` frames, frames enter the buffer in order and
+  frame `f + m` reuses frame `f`'s space, so `s_(f+m) >= s_f + L - 1`. Over
+  many frames, this gives at least `(L-1)/m` cycles/frame on average, and the
+  decoder alone allows at most one frame per `P` cycles. A source that offers
+  frames whenever they are accepted reaches the larger of the two bounds. With
+  single workers, each group of `m` frames enters with `m - 1` gaps of `P`,
+  followed by a gap of `L - 1 - (m-1)*P` until the first frame's space is
+  free.
+
+. *Sizing.* The target holds when `(L-1)/m <= I`, so the smallest number of
+  frames is `m = ceil((L-1)/I)`, which gives the depth above.
+
+. *Paced input.* If frames start at least `I` cycles apart, then
+  `s_(f+m) - s_f >= m*I >= L - 1`, so the reuse bound never forces a frame to
+  wait. The output timing is then the same as with a full-capacity buffer.
+
+. *Capacity bound.* Every stage's latency is at most its number of frame slots
+  times `P`: one each for `RsSyndromes`, `RsChien`, and `RsCorrection`, and one
+  per Berlekamp and Forney worker. Hence `L - 1 < (3 + N_B + N_F) * P`, and for
+  any `I >= P` the depth stays within `full_message_buffer`.
+
+Because the bound links each frame to the frame `m` places earlier, not to
+its predecessor, a frame that arrives late within a group only shortens the
+following gap. For RS(13,7) with `U=4`, `U_B=3`, `U_O=3`, and `U_F=4`, `L=13`
+and `P=4`. A target of 6 cycles/frame gives `m=2`, a 4-beat buffer. Each
+frame starts 12 cycles after the frame two places earlier:
+
+[cols="3,2",options="header"]
+|===
+| Every second frame offered | Spacing of frame starts
+| as soon as accepted | 4, 8
+| 5 cycles after the previous frame | 5, 7
+| 6 cycles after the previous frame | 6, 6
+|===
+
+The rate is therefore an average: a throttled source sees frames accepted in
+bursts, but each group of `m` frames still takes `L-1` cycles. The full buffer
+for this plan holds 10 beats, and `select_message_buffer` returns 6 beats for
+the decoder's own interval.
+
+==== Limits
+
+* Extra beats beyond whole frames let part of the next frame enter early, but
+  that frame still cannot finish until a whole frame of space is free. They
+  save less than one frame, by an amount that depends on handshake details, so
+  the helper uses whole frames.
+* With one-beat message frames, `RsSyndromes`' message register holds one more
+  frame, so the result can be one frame larger than needed.
+* The sizing assumes that the buffer shows committed data before
+  `RsCorrection` needs it, which bypass guarantees.
+
+The tests check throttled and paced input against the target, and that one
+frame less misses the target when the message frame has more than one beat.

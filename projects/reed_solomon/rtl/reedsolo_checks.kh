@@ -1,0 +1,161 @@
+// Explicit representative elaborations for the LSP's all-items compilation.
+// These const blocks check module bodies without adding instances to a DUT.
+// Python compilation is lazy at this revision; keep its concrete --check path.
+import reedsolo.[rs_config, RsDefault];
+import reedsolo_encoder.[RsEncoder];
+import reedsolo_decoder.[RsDecoder, RsDecoderParallelism];
+
+fn check_encoder(RS: type, width: positive) {
+    for (buffered in [false, true]) {
+        RsEncoder(unroll=width, buffered=buffered, RS=RS);
+    }
+}
+
+fn check_pipeline(
+    RS: type, width: positive,
+    berlekamp: positive = 1, omegas: positive = 1, forney: positive = 1,
+    berlekamp_instances: positive = 1, forney_instances: positive = 1,
+) {
+    check_encoder(RS, width);
+    for (buffered in [false, true]) {
+        RsDecoder(
+            parallelism=RsDecoderParallelism.new(
+                stream_unroll=width, berlekamp_unroll=berlekamp, omegas_unroll=omegas, forney_unroll=forney,
+                berlekamp_instances=berlekamp_instances, forney_instances=forney_instances,
+            ),
+            buffered=buffered,
+            RS=RS,
+        );
+    }
+}
+
+// Independent roots let the compiler schedule these checks in parallel.
+const {
+    check_pipeline(RsDefault, 16);
+}
+
+const {
+    // Odd t, nonbinary unroll, alternate alpha/fcr, and a partial Forney cycle.
+    check_pipeline(
+        rs_config(n=12, k=6, m=4, prim=0x13, alpha=3, fcr=0),
+        3, berlekamp=3, omegas=3, forney=4,
+    );
+}
+
+const {
+    // Only k unaligned, only n unaligned, both, and a single-symbol message.
+    check_pipeline(rs_config(n=12, k=6, m=4, prim=0x13, alpha=3, fcr=0), 4);
+    check_pipeline(rs_config(n=14, k=8, m=4, prim=0x13, alpha=3, fcr=0), 4);
+    check_pipeline(rs_config(n=13, k=7, m=4, prim=0x13, alpha=3, fcr=0), 4);
+    check_pipeline(rs_config(n=3, k=1, m=2, prim=0x7, alpha=2, fcr=1), 2);
+}
+
+const {
+    // Padded search crosses the field period, and bus width can exceed it.
+    check_pipeline(rs_config(n=15, k=9, m=4, prim=0x13, alpha=2, fcr=1), 4);
+    check_pipeline(rs_config(n=3, k=1, m=2, prim=0x7, alpha=2, fcr=1), 4);
+    check_pipeline(rs_config(n=13, k=7, m=4, prim=0x13, alpha=3, fcr=0), 16);
+}
+
+const {
+    // Frame-parallel serial BM, including a non-power-of-two worker count.
+    for (workers in [2, 3]) {
+        check_pipeline(
+            rs_config(n=13, k=7, m=4, prim=0x13, alpha=3, fcr=0),
+            4, berlekamp=1, omegas=3, forney=4, berlekamp_instances=workers,
+        );
+    }
+}
+
+const {
+    // Serial Forney workers alone and with a separately sized BM bank.
+    for (workers in [2, 3]) {
+        check_pipeline(
+            rs_config(n=13, k=7, m=4, prim=0x13, alpha=3, fcr=0),
+            4,
+            berlekamp=3,
+            omegas=3,
+            forney=1,
+            berlekamp_instances=1,
+            forney_instances=workers,
+        );
+    }
+    check_pipeline(
+        rs_config(n=13, k=7, m=4, prim=0x13, alpha=3, fcr=0),
+        4, berlekamp=1, omegas=3, forney=1,
+        berlekamp_instances=2, forney_instances=3,
+    );
+}
+
+// Optional elaboration-time planning, alongside the manual roots above.
+import reedsolo_performance.[RsLinearCost, RsChienCost, RsDecoderCosts,
+    frame_interval, select_encoder_unroll, select_decoder_parallelism, decoder_timing,
+    select_message_buffer];
+
+fn check_selection(RS: type, latency: positive, interval: positive, cap: positive) {
+    val unit = RsLinearCost.new(a=1, b=1);
+    val costs = RsDecoderCosts.new(
+        syndromes=unit, berlekamp=unit,
+        chien=RsChienCost.new(a_search=1, a_omegas=1, b=1),
+        forney=unit, correction=unit,
+    );
+    val width = select_encoder_unroll(RS, 1, frame_interval(interval));
+    val plan = select_decoder_parallelism(RS, cap, cap, costs, latency, frame_interval(interval));
+    val predicted = decoder_timing(RS, plan);
+    val buffer = select_message_buffer(RS, plan, frame_interval(interval));
+    assert(predicted.latency <= latency);
+    assert(predicted.interval.cycles <= interval * predicted.interval.frames);
+    for (buffered in [false, true]) {
+        RsEncoder(unroll=width, buffered=buffered, RS=RS);
+        RsDecoder(parallelism=plan, buffered=buffered, RS=RS);
+        RsDecoder(parallelism=plan, buffered=buffered, RS=RS, message_buffer=buffer);
+    }
+}
+
+const {
+    check_selection(RsDefault, 40, 15, 2);
+    check_selection(rs_config(n=13, k=7, m=4, prim=0x13, alpha=3, fcr=0), 22, 4, 1);
+}
+
+// Every packet FIFO memory flavor, with and without bypass, including memories
+// shallower than the bypass window.
+import reedsolo_packet_fifo.[RsPacketFifo, RsFifoMemory, RsRam];
+
+fn check_packet_fifo(T: type, depth: positive) {
+    for (bypass in [false, true]) {
+        RsPacketFifo(T=T, depth=depth, memory=RsFifoMemory.Lut, bypass=bypass);
+        RsPacketFifo(T=T, depth=depth, memory=RsFifoMemory.Block(1), bypass=bypass);
+        RsPacketFifo(T=T, depth=depth, memory=RsFifoMemory.Block(3), bypass=bypass);
+        RsPacketFifo(T=T, depth=depth, memory=RsFifoMemory.External(4), bypass=bypass);
+    }
+    RsRam(T=T, depth=depth, input_latency=1, output_latency=2);
+}
+
+const {
+    check_packet_fifo([4]RsDefault.Sym, 1);
+    check_packet_fifo([4]RsDefault.Sym, 14);
+}
+
+// Non-default message buffers: an external RAM without bypass, and a block
+// RAM sized to exactly one message frame.
+import reedsolo_decoder.RsMessageBuffer;
+
+const {
+    val code = rs_config(n=13, k=7, m=4, prim=0x13, alpha=3, fcr=0);
+    val parallelism = RsDecoderParallelism.new(
+        stream_unroll=4, berlekamp_unroll=3, omegas_unroll=3, forney_unroll=4,
+        berlekamp_instances=1, forney_instances=1,
+    );
+    RsDecoder(
+        parallelism=parallelism,
+        buffered=false,
+        RS=code,
+        message_buffer=RsMessageBuffer.new(depth=5, memory=RsFifoMemory.External(3), bypass=false),
+    );
+    RsDecoder(
+        parallelism=parallelism,
+        buffered=false,
+        RS=code,
+        message_buffer=RsMessageBuffer.new(depth=2, memory=RsFifoMemory.Block(1), bypass=true),
+    );
+}

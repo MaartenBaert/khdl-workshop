@@ -1,0 +1,178 @@
+// Explicit shared-pool alternative for forwarding externally chosen IDs.
+import channel.endpoints.[Transmitter, Receiver];
+import axi.interfaces.[Axi, ManagerChannels, manager_channels];
+import axi.context.[ContextQueue, context_queue];
+import axi.burst.[valid_request, lane_mask];
+
+pub struct ReadResult(C: type, capacity: positive) {
+    token: uint(0..capacity), data: C.Data, resp: uint(2), last: bool, user: uint(C.ruser_width),
+}
+pub struct WriteResult(C: type, capacity: positive) {
+    token: uint(0..capacity), resp: uint(2), user: uint(C.buser_width),
+}
+
+pub struct ManagerRead(C: type, capacity: positive) {
+    type Token = uint(0..capacity);
+    output: Transmitter(C.Ar), input: Receiver(C.R),
+    contexts: ContextQueue(C.Ar, capacity), ref done: [capacity]bool,
+
+    fn can_push(self) -> bool { return self.contexts.can_push() && self.output.can_push(); }
+    // Optional ordering policy for forwarding clients without a reorder buffer.
+    // Pending requests share one ID, retaining pipelining within that ID.
+    fn can_push_ordered(self, id: C.Id) -> bool { return self.can_push() && self.contexts.only_id(id); }
+    fn push(self, request: C.Ar) -> uint(0..capacity) {
+        val available = self.can_push();
+        val valid = valid_request(C, request);
+        assert(available, "ManagerRead.push(): can_push required");
+        assert(valid, "ManagerRead.push(): illegal request");
+        var token: uint(0..capacity) = undef;
+        if (available && valid) {
+            token = self.contexts.push(request);
+            self.done[token] = false;
+            self.output.push(request);
+        }
+        return token;
+    }
+    fn can_pop(self) -> bool { return self.input.can_pop(); }
+    fn peek(self) -> ReadResult(C, capacity) {
+        assert(self.can_pop(), "ManagerRead.peek(): response required");
+        var result: ReadResult(C, capacity) = undef;
+        if (self.can_pop()) {
+            val payload = self.input.peek();
+            val selected = self.contexts.find_id(payload.id, ref(self.done));
+            assert(selected.found, "ManagerRead.peek(): unexpected response ID");
+            if (selected.found) {
+                assert(payload.resp != C.exokay || self.contexts.descriptors[selected.token].lock,
+                    "ManagerRead.peek(): EXOKAY for non-exclusive request");
+                val last = self.contexts.beats[selected.token] == self.contexts.descriptors[selected.token].len;
+                assert(payload.last == last, "ManagerRead.peek(): RLAST does not match ARLEN");
+                result = ReadResult(C, capacity).new(token=selected.token, data=payload.data,
+                    resp=payload.resp, last=last, user=payload.user);
+            }
+        }
+        return result;
+    }
+    fn pop(self) -> ReadResult(C, capacity) {
+        val result = self.peek();
+        if (self.can_pop()) {
+            val _ = self.input.pop();
+            if (result.last) { self.done[result.token] = true; }
+            else {
+                val count = self.contexts.beats[result.token];
+                assert(count < 256, "ManagerRead.pop(): beat overflow");
+                if (count < 256) { self.contexts.beats[result.token] = count + 1; }
+            }
+        }
+        return result;
+    }
+    fn retire(self) {
+        for (i in 0..capacity) {
+            if (self.contexts.can_pop() && self.done[self.contexts.head]) { self.contexts.pop(); }
+        }
+    }
+}
+
+pub struct ManagerWrite(C: type, capacity: positive) {
+    type Token = uint(0..capacity);
+    output: Transmitter(C.Aw), data: Transmitter(C.W), input: Receiver(C.B),
+    contexts: ContextQueue(C.Aw, capacity), ref done: [capacity]bool,
+    ref data_cursor: uint(0..capacity),
+
+    fn can_push(self) -> bool { return self.contexts.can_push() && self.output.can_push(); }
+    fn can_push_ordered(self, id: C.Id) -> bool { return self.can_push() && self.contexts.only_id(id); }
+    fn push(self, request: C.Aw) -> uint(0..capacity) {
+        val available = self.can_push();
+        val valid = valid_request(C, request);
+        assert(available, "ManagerWrite.push(): can_push required");
+        assert(valid, "ManagerWrite.push(): illegal request");
+        var token: uint(0..capacity) = undef;
+        if (available && valid) {
+            token = self.contexts.push(request);
+            self.done[token] = false;
+            self.output.push(request);
+        }
+        return token;
+    }
+    fn can_push_data(self, token: uint(0..capacity)) -> bool {
+        return self.contexts.contains(token) && token == self.data_cursor
+            && self.contexts.beats[token] <= self.contexts.descriptors[token].len
+            && self.data.can_push();
+    }
+    fn push_data(self, token: uint(0..capacity), data: C.Data, strb: C.Strobe,
+                 user: uint(C.wuser_width) = 0) -> bool {
+        val available = self.can_push_data(token);
+        assert(available, "ManagerWrite.push_data(): can_push_data required");
+        var last = false;
+        if (available) {
+            val count = self.contexts.beats[token];
+            val descriptor = self.contexts.descriptors[token];
+            last = count == descriptor.len;
+            assert(count < 256, "ManagerWrite.push_data(): beat overflow");
+            if (count < 256) {
+                val mask = lane_mask(C, descriptor, count);
+                assert((strb & mask) == strb, "ManagerWrite.push_data(): invalid strobe");
+                self.data.push(C.W.new(data=data, strb=strb, last=last, user=user));
+                self.contexts.beats[token] = count + 1;
+            }
+            if (last) {
+                if (self.data_cursor == capacity - 1) { self.data_cursor = 0; }
+                else { self.data_cursor = self.data_cursor + 1; }
+            }
+        }
+        return last;
+    }
+    fn can_pop(self) -> bool { return self.input.can_pop(); }
+    fn peek(self) -> WriteResult(C, capacity) {
+        assert(self.can_pop(), "ManagerWrite.peek(): response required");
+        var result: WriteResult(C, capacity) = undef;
+        if (self.can_pop()) {
+            val payload = self.input.peek();
+            val selected = self.contexts.find_id(payload.id, ref(self.done));
+            assert(selected.found, "ManagerWrite.peek(): unexpected response ID");
+            if (selected.found) {
+                assert(payload.resp != C.exokay || self.contexts.descriptors[selected.token].lock,
+                    "ManagerWrite.peek(): EXOKAY for non-exclusive request");
+                assert(self.contexts.beats[selected.token] == self.contexts.descriptors[selected.token].len + 1,
+                    "ManagerWrite.peek(): response before write data");
+                // A final beat still held in the W register belongs to the most
+                // recently completed burst, just before the data cursor.
+                var previous = capacity - 1;
+                if (self.data_cursor != 0) { previous = self.data_cursor - 1; }
+                if (!self.data.can_push() && self.data.channel.data.last) {
+                    assert(selected.token != previous, "ManagerWrite.peek(): B response before final W transfer");
+                }
+                result = WriteResult(C, capacity).new(token=selected.token, resp=payload.resp, user=payload.user);
+            }
+        }
+        return result;
+    }
+    fn pop(self) -> WriteResult(C, capacity) {
+        val result = self.peek();
+        if (self.can_pop()) { val _ = self.input.pop(); self.done[result.token] = true; }
+        return result;
+    }
+    fn retire(self) {
+        for (i in 0..capacity) {
+            if (self.contexts.can_pop() && self.done[self.contexts.head]) { self.contexts.pop(); }
+        }
+    }
+}
+
+pub struct Manager(C: type, capacity: positive) {
+    channels: ManagerChannels(C), read: ManagerRead(C, capacity), write: ManagerWrite(C, capacity),
+    fn begin(self) { self.channels.begin(); }
+    fn end(self) { self.read.retire(); self.write.retire(); self.channels.end(); }
+}
+
+pub fn pooled_manager(C: type, bus: RefInterface(Axi(C)), capacity: positive = 2) -> Manager(C, capacity) {
+    val channels = manager_channels(C, bus);
+    reg r_read_done: [capacity]bool = [false] * capacity;
+    reg r_write_done: [capacity]bool = [false] * capacity;
+    reg r_data_cursor: uint(0..capacity) = 0;
+    return Manager(C, capacity).new(channels=channels,
+        read=ManagerRead(C, capacity).new(output=channels.ar, input=channels.r,
+            contexts=context_queue(C.Ar, capacity), done=ref(r_read_done)),
+        write=ManagerWrite(C, capacity).new(output=channels.aw, data=channels.w, input=channels.b,
+            contexts=context_queue(C.Aw, capacity), done=ref(r_write_done), data_cursor=ref(r_data_cursor)),
+    );
+}

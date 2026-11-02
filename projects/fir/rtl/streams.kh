@@ -1,0 +1,100 @@
+// Project-local copy/adaptation of the FIFO-style channel APIs. The public
+// interface uses samples, and the output optionally adds one beat clipping flag.
+pub interface Stream(T: type, status: bool = false) {
+    samples: T, valid: bool, ready: bool,
+    if (status) { clipped: bool }
+    view Source {
+        samples: out, valid: out, ready: in,
+        if (status) { clipped: out }
+    }
+    view Sink {
+        samples: in, valid: in, ready: out,
+        if (status) { clipped: in }
+    }
+}
+pub struct Signals(T: type) { ref samples: T, ref valid: bool, ref ready: bool }
+fn signals(T: type, stream: any) -> Signals(T) {
+    return Signals(T).new(samples=ref(deref(stream).samples),
+        valid=ref(deref(stream).valid), ready=ref(deref(stream).ready));
+}
+pub struct Transmitter(T: type) {
+    channel: Signals(T),
+    fn begin(self) {
+        if (self.channel.valid && self.channel.ready) { self.channel.valid = false; }
+    }
+    fn end(self) {}
+    fn can_push(self) -> bool { return !self.channel.valid; }
+    fn push(self, value: T) {
+        assert(self.can_push(), "Transmitter.push requires space");
+        if (self.can_push()) { self.channel.samples = value; self.channel.valid = true; }
+    }
+}
+pub fn transmitter(T: type, stream: any) -> Transmitter(T) {
+    val tx = Transmitter(T).new(channel=signals(T, stream));
+    reg wire tx.channel.samples = undef;
+    reg wire tx.channel.valid = false;
+    return tx;
+}
+pub struct Receiver(T: type) {
+    channel: Signals(T), ref slot: T, ref occupied: bool,
+    // Per-cycle gating scratch, reference-backed until mixed reference/data
+    // struct updates are supported (khdl#38). Actual occupied/slot persist.
+    ref enabled: bool,
+    fn begin(self) {
+        if (self.channel.valid && self.channel.ready) {
+            self.slot = self.channel.samples; self.occupied = true;
+        }
+        self.channel.ready = self.enabled && !self.occupied;
+    }
+    fn set_enabled(self, enabled: bool) {
+        self.enabled = enabled;
+        self.channel.ready = enabled && !self.occupied;
+    }
+    fn end(self) {}
+    fn can_pop(self) -> bool { return self.occupied; }
+    fn peek(self) -> T {
+        assert(self.can_pop(), "Receiver.peek requires data");
+        return self.slot;
+    }
+    fn pop(self) -> T {
+        val result = self.peek();
+        if (self.can_pop()) { self.occupied = false; self.channel.ready = self.enabled; }
+        return result;
+    }
+}
+pub fn receiver(T: type, stream: any, initial_ready: bool = true) -> Receiver(T) {
+    reg r_slot: T = undef;
+    reg r_occupied: bool = false;
+    reg r_enabled: bool = initial_ready;
+    val rx = Receiver(T).new(channel=signals(T, stream), slot=ref(r_slot),
+        occupied=ref(r_occupied), enabled=ref(r_enabled));
+    reg wire rx.channel.ready = initial_ready;
+    return rx;
+}
+
+// Immediate observations allow pop then push in the same process. Traversing
+// stages downstream-first gives registered pipeline boundaries, not bypass.
+pub struct Internal(T: type) {
+    ref slot: T, ref valid: bool,
+    fn begin(self) {}
+    fn end(self) {}
+    fn can_push(self) -> bool { return !self.valid; }
+    fn can_pop(self) -> bool { return self.valid; }
+    fn push(self, value: T) {
+        assert(self.can_push(), "Internal.push requires space");
+        if (self.can_push()) { self.slot = value; self.valid = true; }
+    }
+    fn peek(self) -> T {
+        assert(self.can_pop(), "Internal.peek requires data"); return self.slot;
+    }
+    fn pop(self) -> T {
+        val result = self.peek();
+        if (self.can_pop()) { self.valid = false; }
+        return result;
+    }
+}
+pub fn internal(T: type) -> Internal(T) {
+    reg r_slot: T = undef;
+    reg r_valid: bool = false;
+    return Internal(T).new(slot=ref(r_slot), valid=ref(r_valid));
+}

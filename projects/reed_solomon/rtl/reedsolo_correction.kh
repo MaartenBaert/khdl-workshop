@@ -1,0 +1,155 @@
+// Structural port of reedsolo_correction_ent.vhd and _rtl.vhd.
+// Reset is synchronous; r_ variables retain state across rising edges.
+import reedsolo.[RsDefault];
+import reedsolo_interfaces.[RsTransaction, RsForneyBlock, RsStream];
+
+pub module RsCorrection(unroll: positive = 1, RS: type = RsDefault) ports(
+    // clock and synchronous reset
+    clk: in clock,
+    sync(clk) {
+        rst: in bool,
+        // inputs
+        input: interface RsTransaction(RsForneyBlock(unroll, RS=RS)).Sink,
+        // the received message beats, in stream order, from a packet FIFO
+        message: interface RsTransaction([unroll]RS.Sym).Sink,
+        // output stream
+        output: interface RsStream(unroll, decoded=true, RS=RS).Source,
+    }
+) {
+    const c_correction_cycles = RS.k +/ unroll;
+    const c_codeword_cycles = RS.n +/ unroll;
+    const c_message_size = c_correction_cycles * unroll;
+    const c_message_padding = c_message_size - RS.k;
+    const c_bb_layers = clog2(unroll);
+    const c_bb_width = 2**c_bb_layers;
+    // A message beat is taken whenever an output beat is produced: while a
+    // block is being processed, or arrives this cycle, and the output register
+    // is free or drains at this edge.
+    wire r_processing_out: sync(clk) bool;
+    comb {
+        message.ready = (r_processing_out || input.valid) && (!output.valid || output.ready);
+    }
+    clocked(clk, sync rst) {
+        reg wire r_processing_out = false;
+        reg wire input.ready = true;
+        reg wire output.data = undef;
+        reg wire output.last = false;
+        reg wire output.num_errors = undef;
+        reg wire output.failed = undef;
+        reg wire output.valid = false;
+        // output registers
+        reg r_fc_output_data: [unroll]RS.Sym = undef;
+        reg r_fc_output_last: bool = false;
+        reg r_fc_output_num_errors: uint(0..=RS.t) = undef;
+        reg r_fc_output_failed: bool = undef;
+        reg r_fc_output_valid: bool = false;
+        // registers for processing
+        reg r_error_cpos: [RS.t]uint(RS.m) = [0] * RS.t;
+        reg r_error_upos: [RS.t]uint(0..unroll) = [0] * RS.t;
+        reg r_error_val: [RS.t]RS.Sym = [RS.sym_zero] * RS.t;
+        reg r_num_errors: uint(0..=RS.t) = 0;
+        reg r_failed: bool = false;
+        // status registers
+        reg r_processing: bool = false;
+        reg r_progress_counter: uint(0..c_correction_cycles) = c_correction_cycles - 1;
+        // store incoming block (and discard previous one)
+        if (input.valid && !r_processing) {
+            for (i in 0..RS.t) {
+                r_error_cpos[i] = input.data.error_cpos[i];
+                r_error_upos[i] = input.data.error_upos[i];
+            }
+            r_error_val = input.data.error_val;
+            r_num_errors = input.data.num_errors;
+            r_failed = input.data.failed;
+            r_processing = true;
+            r_progress_counter = c_correction_cycles - 1;
+        }
+        // output flow control
+        if (output.ready) {
+            r_fc_output_valid = false;
+        }
+        // process the stored block
+        if (r_processing && !r_fc_output_valid && message.valid) {
+            // copy data to output register
+            r_fc_output_data = message.data;
+            r_fc_output_last = r_progress_counter == 0;
+            r_fc_output_num_errors = r_num_errors;
+            r_fc_output_failed = r_failed;
+            r_fc_output_valid = true;
+            // initialize butterfly balancer
+            var v_bb_flag = [false] * c_bb_width;
+            var v_bb_upos: [c_bb_width]uint(0..unroll) = [0] * c_bb_width;
+            var v_bb_val: [c_bb_width]RS.Sym = [RS.sym_zero] * c_bb_width;
+            // determine which errors we need to correct this cycle
+            for (i in 0..min(c_bb_width, RS.t)) {
+                // Chien and the message output are both anchored at the
+                // high end of the codeword. Their lanes already match.
+                v_bb_flag[i] = r_error_cpos[i] == r_progress_counter + c_codeword_cycles - c_correction_cycles;
+                v_bb_upos[i] = r_error_upos[i];
+                v_bb_val[i] = r_error_val[i];
+                if (v_bb_flag[i]) {
+                    for (j in 0..(RS.t - i - 1) / c_bb_width) {
+                        r_error_cpos[i + j * c_bb_width] = r_error_cpos[i + (j + 1) * c_bb_width];
+                        r_error_upos[i + j * c_bb_width] = r_error_upos[i + (j + 1) * c_bb_width];
+                        r_error_val[i + j * c_bb_width] = r_error_val[i + (j + 1) * c_bb_width];
+                    }
+                    r_error_cpos[i + (RS.t - i - 1) / c_bb_width * c_bb_width] = c_codeword_cycles;
+                    r_error_upos[i + (RS.t - i - 1) / c_bb_width * c_bb_width] = 0;
+                    r_error_val[i + (RS.t - i - 1) / c_bb_width * c_bb_width] = RS.sym_zero;
+                }
+            }
+            // reverse butterfly balancer
+            for (l_rev in 0..c_bb_layers) {
+                val l = (c_bb_layers - 1) + (0) - l_rev;
+                for (g in 0..2**(c_bb_layers - 1 - l)) {
+                    for (h in 0..2**l) {
+                        val v_ind1 = (2 * g + 0) * 2**l + h;
+                        val v_ind2 = (2 * g + 1) * 2**l + h;
+                        val v_swap1 = v_bb_flag[v_ind1] && (v_bb_upos[v_ind1] / 2**l) % 2 == 1;
+                        val v_swap2 = v_bb_flag[v_ind2] && (v_bb_upos[v_ind2] / 2**l) % 2 == 0;
+                        if (v_swap1 || v_swap2) {
+                            val v_temp_flag = v_bb_flag[v_ind1];
+                            v_bb_flag[v_ind1] = v_bb_flag[v_ind2];
+                            v_bb_flag[v_ind2] = v_temp_flag;
+                            val v_temp_upos = v_bb_upos[v_ind1];
+                            v_bb_upos[v_ind1] = v_bb_upos[v_ind2];
+                            v_bb_upos[v_ind2] = v_temp_upos;
+                            val v_temp_val = v_bb_val[v_ind1];
+                            v_bb_val[v_ind1] = v_bb_val[v_ind2];
+                            v_bb_val[v_ind2] = v_temp_val;
+                        }
+                    }
+                }
+            }
+            // correct errors in output data
+            if (!r_failed) {
+                for (i_rev in 0..unroll) {
+                    val i = (unroll - 1) + (0) - i_rev;
+                    if (v_bb_flag[i]) {
+                        r_fc_output_data[i] = r_fc_output_data[i] ^ v_bb_val[i];
+                    }
+                }
+            }
+            // Parity errors can share the last message group. Discard their
+            // corrected lanes after the XOR, including on failed passthrough.
+            if (r_fc_output_last) {
+                r_fc_output_data[0..c_message_padding] = [RS.sym_zero] * c_message_padding;
+            }
+            // update progress counter
+            if (r_progress_counter == 0) {
+                r_processing = false;
+                r_progress_counter = c_correction_cycles - 1;
+            } else {
+                r_progress_counter = r_progress_counter - 1;
+            }
+        }
+        // output data from updated register variables
+        input.ready = !r_processing;
+        r_processing_out = r_processing;
+        output.data = r_fc_output_data;
+        output.last = r_fc_output_last;
+        output.num_errors = r_fc_output_num_errors;
+        output.failed = r_fc_output_failed;
+        output.valid = r_fc_output_valid;
+    }
+}

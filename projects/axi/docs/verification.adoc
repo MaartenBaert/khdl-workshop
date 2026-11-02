@@ -1,0 +1,114 @@
+[[axi-verification]]
+== Verification and limits
+
+[[axi-verification-commands]]
+=== Commands and tools
+
+From the repository root:
+
+----
+.venv/bin/python -m projects.axi.tools.compile --check
+.venv/bin/python -m projects.axi.tools.compile
+.venv/bin/pytest projects/axi/tests
+.venv/bin/python -m projects.axi.tools.formal --depth 12
+.venv/bin/python -m projects.axi.tools.formal --target error --depth 8 --out build/axi/formal-error
+.venv/bin/python docs/build.py
+----
+
+The `--check` run elaborates the concrete profiles in `rtl/channel/examples.kh`,
+`rtl/channel/ref_self.kh`, and `rtl/examples/checks.kh`. Without it, the tool also
+exports the demonstration modules to `build/axi/verilog/`. `setup.sh` installs
+the Python test dependencies, including cocotb 2.x and cocotbext-axi 0.1.x.
+Verilator is required; Yosys is required for the formal test and tool. Builds
+use ignored paths or pytest temporary directories.
+
+[[axi-channel-verification]]
+=== Channel tests
+
+Transaction scoreboards cover different payloads, queue counts, depths, loop
+orders, stalls, reset, and module boundaries. Separate method-level tests check
+immediate endpoint effects, independent Fifo sides, Internal chaining, peek
+behavior, precondition failures, and lifecycle errors. Implementation-specific
+tests measure full-rate operation separately from the application correctness
+tests. Negative elaboration tests cover binding roles, payload types,
+process/reset/clock context, state ownership, and reference escape.
+
+[[axi4-verification]]
+=== AXI4 tests
+
+Verification combines native API tests, independent burst arithmetic,
+cycle-level scoreboards, adversarial response schedules, and
+https://github.com/alexforencich/cocotbext-axi[cocotbext-axi] Manager and RAM
+peers. Profiles cover 8/32/64-bit simulated data paths, a 1024-bit
+arithmetic/elaboration profile, absent and present optional fields,
+non-power-of-two context capacities, Internal/Fifo scheduling, stalls, reset,
+errors, and malformed-peer assertions.
+
+Endpoint tests hold an older endpoint outstanding while another repeatedly
+fills and reuses a three-slot queue, check separate response buffers and
+configured IDs, and enforce global AW/W order while B completion is withheld.
+Elaboration tests cover heterogeneous groups, disabled directions, zero-width
+IDs, and 1024-bit data. They reject duplicate or out-of-range IDs, runtime IDs,
+and incorrect endpoint roles. Private KHDL test facades live under
+`tests/rtl/`, outside the production API.
+
+[[axi4-formal]]
+=== Bounded formal checks
+
+The Yosys SAT harness checks all five channels of a small `AxiPipeline` with
+independent two-entry scoreboards. Assertions cover capacity, absence of
+phantom outputs, payload order, and stalled output stability. Peers must hold
+stalled inputs; reset is asserted initially and then released. A corrupted-AW
+negative control must produce a counterexample. The 12-cycle run is bounded
+transport safety, not an unbounded proof, a liveness result, or
+transaction-wide formal verification.
+
+A second bounded harness checks `AxiError` with two context slots, one-bit IDs,
+and two-beat bursts: correct counts, IDs, LAST, DECERR, B dependencies, stalled
+outputs, and reset. Address attributes are fixed to legal byte-wide INCR
+accesses; IDs, channel availability, and response stalls are unconstrained.
+Independent scoreboards limit outstanding requests and early W bursts to four.
+A reachability check requires early W, overlapping requests, a final R transfer,
+and a B transfer in the same bounded trace, which shows that these assumptions
+permit useful progress. It does not prove eventual completion. Arbitrary burst
+lengths, Manager response interleaving, routing, and memory semantics have
+simulation coverage rather than formal proofs; broader transaction-wide
+verification remains future work.
+https://github.com/ZipCPU/wb2axip#formal-verification[ZipCPU's public full-AXI properties]
+are explicitly incomplete and do not supply a complete verification suite.
+See `formal/README.md` for the harness details.
+
+[[axi-verification-synthesis]]
+=== Synthesis and remaining limits
+
+KHDL currently lowers runtime assertions to unguarded printing and `$finish`.
+Verilator handles these checks, but Yosys 0.66 rejects `$finish` in an always
+block. https://github.com/khdl-lang/khdl/issues/36[khdl#36] contains a minimal reproducer. Real exports need
+a compiler or backend synthesis guard before direct Yosys synthesis is usable.
+The formal tool therefore preserves the original export and creates an
+explicitly named formal-only copy, replacing guarded failure tasks with
+assertions and removing only diagnostic text. Unexpected lowering is rejected,
+and normal RTL exports are unchanged.
+
+Exploratory Yosys generic-cell experiments, with only those simulation tasks
+removed in temporary copies, have compared structures. In an earlier version,
+Fifo stages kept combinational paths local between queues. Balanced round-robin
+trees were shallower than the linear scan for larger endpoint counts. These comparisons
+are not technology mapping, a formal proof, physical timing, or a guarantee for
+other configurations. Neither simulation nor the formal checks establish
+physical timing or technology-specific area.
+
+The Manager's address arbiters use the linear two-pass scan. The KHDL skill's
+`skills/khdl/assets/round_robin.kh` also provides two balanced-tree selectors
+with the same result. `tests/test_synthesis_patterns.py` compares all three
+against an independent model, both as compile-time calls and in simulation.
+The simulations cover 1, 3, 5, 8, 17, 32, and 65 requesters: exhaustively over
+request masks and previous winners up to 8, and for larger counts with empty
+and full masks, every single-request position, and random masks.
+
+Scratch reference registers remain clearly marked for replacement when mixed
+hardware/reference structs are fixed (https://github.com/khdl-lang/khdl/issues/38[khdl#38]). https://github.com/khdl-lang/khdl/issues/35[khdl#35]
+records the lack of view-qualified interface reference types; the binding
+functions' output-register declarations still reject wrong-direction bindings.
+The generic channel examples do not implement AXI transaction semantics. CDC
+and general crossbar arbitration remain outside this project.

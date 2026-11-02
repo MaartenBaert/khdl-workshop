@@ -1,0 +1,114 @@
+// Structural port of reedsolo_berlekamp_ent.vhd and _rtl.vhd.
+// Reset is synchronous; r_ variables retain state across rising edges.
+import reedsolo.[RsDefault];
+import reedsolo_interfaces.[RsTransaction, RsBerlekampBlock, RsSyndromesBlock];
+
+pub module RsBerlekamp(unroll: positive = 1, RS: type = RsDefault) ports(
+    // clock and synchronous reset
+    clk: in clock,
+    sync(clk) {
+        rst: in bool,
+        // inputs
+        input: interface RsTransaction(RsSyndromesBlock(RS=RS)).Sink,
+        // outputs
+        output: interface RsTransaction(RsBerlekampBlock(RS=RS)).Source,
+    }
+) {
+    const {
+        assert((2 * RS.t) % unroll == 0, "Berlekamp unroll must divide the iteration count");
+    }
+    const c_berlekamp_cycles = (2 * RS.t) +/ unroll;
+    wire r_input_ready_cond: sync(clk) bool;
+    wire r_input_ready_uncond: sync(clk) bool;
+    comb {
+        input.ready = (r_input_ready_cond && output.ready) || r_input_ready_uncond;
+    }
+    clocked(clk, sync rst) {
+        reg wire output.data = RsBerlekampBlock(RS=RS).new(
+            syndromes=[RS.sym_zero] * (2 * RS.t),
+            lambdas=[1, *([0] * RS.t)],
+            num_errors=0,
+        );
+        reg wire output.valid = false;
+        reg wire r_input_ready_cond = true;
+        reg wire r_input_ready_uncond = true;
+        // output registers
+        reg r_fc_output_valid: bool = false;
+        // registers for processing
+        reg r_syndromes: [2 * RS.t]RS.Sym = [RS.sym_zero] * (2 * RS.t);
+        reg r_cx: [RS.t + 1]RS.Sym = [1, *([0] * RS.t)];
+        reg r_bx: [RS.t + 1]RS.Sym = [1, *([0] * RS.t)];
+        reg r_b: RS.Sym = RS.sym_one;
+        reg r_num_errors: uint(0..=2 * RS.t) = 0;
+        // status registers
+        reg r_processing: bool = false;
+        reg r_progress_counter: uint(0..c_berlekamp_cycles) = 0;
+        // store incoming block
+        if (output.ready) {
+            r_fc_output_valid = false;
+        }
+        if (input.valid && !r_processing && !r_fc_output_valid) {
+            r_syndromes = input.data.syndromes;
+            r_cx = [1, *([0] * RS.t)];
+            r_bx = [1, *([0] * RS.t)];
+            r_b = RS.sym_one;
+            r_num_errors = 0;
+            r_processing = true;
+            r_progress_counter = 0;
+        }
+        // process the stored block
+        if (r_processing) {
+            // Berlekamp-Massey algorithm
+            for (i in 0..unroll) {
+                val v_iter = r_progress_counter * unroll + i;
+                val v_first = r_syndromes[0];
+                r_syndromes[0..2 * RS.t - 1] = r_syndromes[1..2 * RS.t];
+                r_syndromes[2 * RS.t - 1] = v_first;
+                r_bx[1..=RS.t] = r_bx[0..RS.t];
+                r_bx[0] = RS.sym_zero;
+                var v_reduce: RS.SymLong = RS.sym_zero_long;
+                for (j in 0..=RS.t) {
+                    val v_temp = r_syndromes[2 * RS.t - 1 - j];
+                    v_reduce = v_reduce ^ RS.gf_mul_long(r_cx[j], v_temp);
+                }
+                val v_d = RS.gf_reduce(v_reduce);
+                var v_cxb: [RS.t + 1]RS.Sym = undef;
+                for (j in 0..=RS.t) {
+                    v_cxb[j] = RS.gf_mul(r_cx[j], r_b);
+                    r_cx[j] = v_cxb[j] ^ RS.gf_mul(r_bx[j], v_d);
+                }
+                if (v_d != RS.sym_zero && 2 * r_num_errors <= v_iter) {
+                    val new_degree = v_iter + 1 - r_num_errors;
+                    // The guard proves nonnegativity mathematically; current
+                    // range analysis does not track this relation between values.
+                    assert_assume(new_degree >= 0, "Berlekamp degree must remain nonnegative");
+                    r_num_errors = new_degree;
+                    r_bx = v_cxb;
+                    r_b = RS.gf_mul(r_b, v_d);
+                }
+            }
+            // update progress counter
+            if (r_progress_counter == c_berlekamp_cycles - 1) {
+                r_processing = false;
+                r_progress_counter = 0;
+                r_fc_output_valid = true;
+            } else {
+                r_progress_counter = r_progress_counter + 1;
+            }
+        }
+        // output data from updated register variables
+        if (!r_processing) {
+            r_input_ready_cond = true;
+            r_input_ready_uncond = !r_fc_output_valid;
+        } else {
+            r_input_ready_cond = false;
+            r_input_ready_uncond = false;
+        }
+        output.data = RsBerlekampBlock(RS=RS).new(
+            syndromes=r_syndromes,
+            lambdas=r_cx,
+            num_errors=r_num_errors,
+        );
+        output.valid = r_fc_output_valid;
+    }
+}

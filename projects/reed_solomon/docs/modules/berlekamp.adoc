@@ -1,0 +1,62 @@
+[[reed-solomon-berlekamp]]
+=== RsBerlekamp
+
+Source: `rtl/reedsolo_berlekamp.kh`.
+
+==== Function and interfaces
+
+`RsBerlekamp` runs inversionless Berlekamp–Massey on the `R` syndromes to
+derive the error-locator polynomial `lambdas[0..=t]` and its estimated
+degree. It performs `R` serial iterations, unrolling `U_B` per clock.
+The locator is not necessarily normalized; `RsChien` and `RsForney` use its
+consistent scale. The degree can exceed `t` on an uncorrectable frame.
+This stage itself emits no `failed` flag.
+
+`input` is `RsTransaction(RsSyndromesBlock(RS=RS)).Sink` and `output` is
+`RsTransaction(RsBerlekampBlock(RS=RS)).Source`. The syndrome array passes
+through unchanged in the completed transaction.
+The syndrome working shift register performs one full rotation over the
+`R` iterations. The output adds `lambdas[t+1]` and `num_errors` in
+`0..=R`; here `num_errors` means locator degree, not a validated
+root count.
+
+[cols="1,1,3",options="header"]
+|===
+|Parameter |Default |Effect / constraint
+|RS |RsDefault |Configuration determining `R` and `t`.
+|unroll |1 |`U_B` serial BM iterations per cycle; must divide `R`.
+|===
+
+==== Timing and capacity
+
+Each unrolled iteration depends on the previous one, so increasing `U_B`
+lengthens the combinational path. Factors above four are legal, but chain so
+many dependent iterations that they have little practical value. Replicating
+workers (<<reed-solomon-decoder-parallelism>>) raises throughput without that cost.
+
+Define `B=R/U_B`. An accepted block executes its first unrolled iteration
+group on that same edge. Its output can transfer `B` cycles after the input
+transfer, if downstream is ready. The next block can be accepted on the
+edge that transfers the previous result, for a minimum block initiation
+interval of `B` cycles. The stage cannot accept another block while it
+computes, and has no separate queued input block.
+
+.Two computation edges, then a held result while the consumer is stalled.
+[wavedrom]
+....
+{"signal":[
+  {"name":"clk","wave":"p....."},
+  {"name":"input.valid","wave":"10...."},
+  {"name":"input.ready","wave":"10..1."},
+  {"name":"BM iterations","wave":"23x...","data":["0..2","3..5"]},
+  {"name":"output.valid","wave":"0.1..0"},
+  {"name":"output.ready","wave":"0...1."},
+  {"name":"output block","wave":"x.2..x","data":["result"]},
+  {"name":"output transfer","wave":"0...10"}
+],"head":{"text":"RsBerlekamp: RS(13,7), U_B=3","tick":0},"config":{"hscale":3}}
+....
+
+Backpressure delays output transfer and subsequent block acceptance, but
+does not interrupt an already accepted block's computation. Wider unroll
+chains more serial BM iterations into one cycle; this reduces clock count
+without guaranteeing a faster implementation in elapsed time.

@@ -1,0 +1,125 @@
+import axi.types.AxiDefault;
+import axi.interfaces.Axi;
+import axi.pooled_manager.pooled_manager;
+import axi.subordinate.subordinate;
+import channel.buffers.storage;
+
+struct RouteJob(capacity: positive) { token: uint(0..capacity), downstream: uint(0..capacity), destination: uint(0..3) }
+
+fn destination(address: any, base0: uint, size0: positive, base1: uint, size1: positive) -> uint(0..3) {
+    if (base0 <= address && address < base0 + size0) { return 0; }
+    if (base1 <= address && address < base1 + size1) { return 1; }
+    return 2;
+}
+
+// The same transaction-level dispatch works for read and write request queues.
+fn dispatch(C: type, capacity: positive, upstream: any, downstream: any, jobs: any,
+            base0: uint, size0: positive, base1: uint, size1: positive) {
+    if (upstream.can_pop() && jobs.can_push()) {
+        val request = upstream.peek();
+        val selected = destination(request.address.addr, base0, size0, base1, size1);
+        val bases = [base0, base1];
+        for (i in 0..2) {
+            if (selected == i && downstream[i].can_push_ordered(request.address.id)) {
+                val _ = upstream.pop();
+                var address = request.address;
+                val base = bases[i];
+                val absolute = address.addr;
+                assert(absolute >= base, "AxiRouter: address below selected window");
+                if (absolute >= base) { address.addr = absolute - base; }
+                val token = downstream[i].push(address);
+                jobs.push(RouteJob(capacity).new(token=request.token, downstream=token, destination=i));
+            }
+        }
+        if (selected == 2) {
+            val _ = upstream.pop();
+            jobs.push(RouteJob(capacity).new(token=request.token, downstream=0, destination=2));
+        }
+    }
+}
+
+// Two disjoint 4KiB-aligned windows and an internal error destination. Legal
+// AXI4 bursts cannot cross these routing boundaries. Preserve every attribute
+// and ID. A destination accepts a different ID after its current ID window
+// drains, avoiding full-burst reorder storage while allowing same-ID pipelining.
+pub module AxiRouter(C: type = AxiDefault, capacity: positive = 3, queue_depth: positive = 2,
+    base0: uint = 0, size0: positive = 4096,
+    base1: uint = 4096, size1: positive = 4096,
+    const {
+        assert(base0 % 4096 == 0 && base1 % 4096 == 0 && size0 % 4096 == 0 && size1 % 4096 == 0,
+            "AxiRouter windows must be 4KiB aligned");
+        assert(base0 + size0 <= base1 || base1 + size1 <= base0, "AxiRouter windows overlap");
+        assert(base0 + size0 <= 2**C.addr_width && base1 + size1 <= 2**C.addr_width,
+            "AxiRouter windows exceed address width");
+    }
+) ports(
+    clk: in clock, rst: in async bool,
+    sync(clk, async rst) {
+        input: interface Axi(C).Subordinate,
+        output0: interface Axi(C).Manager,
+        output1: interface Axi(C).Manager,
+    }
+) {
+    clocked(clk, async rst) {
+        val upstream = subordinate(C, ref(input), capacity);
+        val downstream = [pooled_manager(C, ref(output0), capacity), pooled_manager(C, ref(output1), capacity)];
+        val reads = storage(RouteJob(capacity), queue_depth);
+        val writes = storage(RouteJob(capacity), queue_depth);
+        val completions = storage(RouteJob(capacity), queue_depth);
+        upstream.begin();
+        for (i in 0..2) { downstream[i].begin(); }
+        reads.begin(); writes.begin(); completions.begin();
+        dispatch(C, capacity, upstream.read, [downstream[0].read, downstream[1].read], reads, base0, size0, base1, size1);
+        dispatch(C, capacity, upstream.write, [downstream[0].write, downstream[1].write], writes, base0, size0, base1, size1);
+
+        if (reads.can_pop()) {
+            val job = reads.peek();
+            if (upstream.read.can_respond(job.token)) {
+                for (i in 0..2) {
+                    if (job.destination == i && downstream[i].read.can_pop()) {
+                        val beat = downstream[i].read.pop();
+                        assert(beat.token == job.downstream, "AxiRouter: read context order");
+                        if (upstream.read.respond(job.token, beat.data, beat.resp, beat.user)) { val _ = reads.pop(); }
+                    }
+                }
+                if (job.destination == 2) {
+                    if (upstream.read.respond(job.token, 0, C.decerr)) { val _ = reads.pop(); }
+                }
+            }
+        }
+        if (writes.can_pop() && completions.can_push()) {
+            val job = writes.peek();
+            if (upstream.write.can_pop_data(job.token)) {
+                for (i in 0..2) {
+                    if (job.destination == i && downstream[i].write.can_push_data(job.downstream)) {
+                        val beat = upstream.write.pop_data(job.token);
+                        val last = downstream[i].write.push_data(job.downstream, beat.data, beat.strb, beat.user);
+                        assert(last == beat.last, "AxiRouter: write burst length");
+                        if (last) { completions.push(job); val _ = writes.pop(); }
+                    }
+                }
+                if (job.destination == 2) {
+                    val beat = upstream.write.pop_data(job.token);
+                    if (beat.last) { completions.push(job); val _ = writes.pop(); }
+                }
+            }
+        }
+        if (completions.can_pop()) {
+            val job = completions.peek();
+            if (upstream.write.can_complete(job.token)) {
+                for (i in 0..2) {
+                    if (job.destination == i && downstream[i].write.can_pop()) {
+                        val response = downstream[i].write.pop();
+                        assert(response.token == job.downstream, "AxiRouter: write context order");
+                        upstream.write.complete(job.token, response.resp, response.user);
+                        val _ = completions.pop();
+                    }
+                }
+                if (job.destination == 2) { upstream.write.complete(job.token, C.decerr); val _ = completions.pop(); }
+            }
+        }
+        completions.end(); writes.end(); reads.end();
+        for (i in 0..2) { downstream[i].end(); }
+        upstream.end();
+    }
+}

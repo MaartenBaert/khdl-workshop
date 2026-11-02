@@ -1,0 +1,111 @@
+// Isolated ref-self experiment: ordinary per-cycle state, persistent payload
+// storage through references. The production queue-array APIs stay in
+// endpoints.kh and buffers.kh.
+import channel.endpoints.Channel;
+
+struct Transmitter(T: type) {
+    ref channel: Channel(T),
+    active: bool,
+
+    fn begin(ref self) {
+        assert(!self.active, "Transmitter.begin(): previous cycle not ended");
+        self.active = true;
+        if (self.channel.valid && self.channel.ready) {
+            self.channel.valid = false;
+        }
+    }
+    fn end(ref self) {
+        assert(self.active, "Transmitter.end(): begin required");
+        self.active = false;
+    }
+    fn can_push(self) -> bool {
+        assert(self.active, "Transmitter.can_push(): begin required");
+        return !self.channel.valid;
+    }
+    fn push(ref self, data: T) {
+        val available = self.can_push();
+        assert(available, "Transmitter.push(): can_push required");
+        if (available) {
+            self.channel.data = data;
+            self.channel.valid = true;
+        }
+    }
+}
+
+fn transmitter(T: type, channel: RefInterface(Channel(T))) -> Transmitter(T) {
+    val tx = Transmitter(T).new(channel=channel, active=false);
+    reg wire tx.channel.data = undef;
+    reg wire tx.channel.valid = false;
+    return tx;
+}
+
+struct Receiver(T: type) {
+    ref channel: Channel(T),
+    ref slot: T,
+    active: bool,
+
+    fn begin(ref self) {
+        assert(!self.active, "Receiver.begin(): previous cycle not ended");
+        self.active = true;
+        if (self.channel.ready && self.channel.valid) {
+            self.slot = self.channel.data;
+            self.channel.ready = false;
+        }
+    }
+    fn end(ref self) {
+        assert(self.active, "Receiver.end(): begin required");
+        self.active = false;
+    }
+    fn can_pop(self) -> bool {
+        assert(self.active, "Receiver.can_pop(): begin required");
+        return !self.channel.ready;
+    }
+    fn peek(self) -> T {
+        val available = self.can_pop();
+        assert(available, "Receiver.peek(): can_pop required");
+        var data: T = undef;
+        if (available) { data = self.slot; }
+        return data;
+    }
+    fn pop(ref self) -> T {
+        val data = self.peek();
+        if (self.can_pop()) { self.channel.ready = true; }
+        return data;
+    }
+}
+
+fn receiver(T: type, channel: RefInterface(Channel(T))) -> Receiver(T) {
+    reg r_slot: T = undef;
+    val rx = Receiver(T).new(channel=channel, slot=ref(r_slot), active=false);
+    reg wire rx.channel.ready = true;
+    return rx;
+}
+
+
+fn forward(input: any, output: any) {
+    if (deref(input).can_pop() && deref(output).can_push()) {
+        deref(output).push(deref(input).pop());
+    }
+}
+
+module Relay(T: type) ports(
+    clk: in clock,
+    sync(clk) {
+        rst: in bool,
+        input: interface Channel(T).Receiver,
+        output: interface Channel(T).Transmitter,
+    }
+) {
+    clocked(clk, sync rst) {
+        var rx = receiver(T, ref(input));
+        var tx = transmitter(T, ref(output));
+        rx.begin(); tx.begin();
+        forward(ref(rx), ref(tx));
+        tx.end(); rx.end();
+    }
+}
+
+fn check_examples() {
+    for (T in [bool, uint(8), [3]uint(4), uint(0..1)]) { Relay(T); }
+}
+const { check_examples(); }

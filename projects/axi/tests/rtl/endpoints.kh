@@ -1,0 +1,58 @@
+// Independent command/result streams exercise statically selected endpoints
+// with heterogeneous capacities and response storage implementations.
+import channel.endpoints.[Channel, receiver, transmitter];
+import axi.interfaces.Axi;
+import axi.types.AxiDefault;
+import axi.manager.[manager, read_endpoint, write_endpoint, ReadBeat, WriteCompletion];
+
+struct WriteData(C: type) { data: C.Data, strb: C.Strobe, user: uint(C.wuser_width) }
+
+module EndpointsProbe(C: type = AxiDefault) ports(
+    clk: in clock, rst: in async bool,
+    sync(clk, async rst) {
+        bus: interface Axi(C).Manager,
+        read0_request: interface Channel(C.Ar).Receiver,
+        read1_request: interface Channel(C.Ar).Receiver,
+        write0_request: interface Channel(C.Aw).Receiver,
+        write1_request: interface Channel(C.Aw).Receiver,
+        write0_data: interface Channel(WriteData(C)).Receiver,
+        write1_data: interface Channel(WriteData(C)).Receiver,
+        read0_result: interface Channel(ReadBeat(C)).Transmitter,
+        read1_result: interface Channel(ReadBeat(C)).Transmitter,
+        write0_result: interface Channel(WriteCompletion(C)).Transmitter,
+        write1_result: interface Channel(WriteCompletion(C)).Transmitter,
+    }
+) {
+    clocked(clk, async rst) {
+        val read0 = read_endpoint(C, id=1);
+        val read1 = read_endpoint(C, id=5, capacity=3, response_depth=2);
+        val write0 = write_endpoint(C, id=1);
+        val write1 = write_endpoint(C, id=5, capacity=3, response_depth=3);
+        val api = manager(C, ref(bus), reads=(read0, read1), writes=(write0, write1));
+        val read_requests = [receiver(C.Ar, ref(read0_request)), receiver(C.Ar, ref(read1_request))];
+        val write_requests = [receiver(C.Aw, ref(write0_request)), receiver(C.Aw, ref(write1_request))];
+        val write_data = [receiver(WriteData(C), ref(write0_data)), receiver(WriteData(C), ref(write1_data))];
+        val read_results = [transmitter(ReadBeat(C), ref(read0_result)), transmitter(ReadBeat(C), ref(read1_result))];
+        val write_results = [transmitter(WriteCompletion(C), ref(write0_result)), transmitter(WriteCompletion(C), ref(write1_result))];
+        api.begin();
+        forward(read0, write0, read_requests[0], write_requests[0], write_data[0], read_results[0], write_results[0]);
+        forward(read1, write1, read_requests[1], write_requests[1], write_data[1], read_results[1], write_results[1]);
+        api.end();
+    }
+}
+
+fn forward(read: any, write: any, read_requests: any, write_requests: any, write_data: any,
+    read_results: any, write_results: any) {
+    read_requests.begin(); write_requests.begin(); write_data.begin();
+    read_results.begin(); write_results.begin();
+    if (read_requests.can_pop() && read.can_push()) { read.push(read_requests.pop()); }
+    if (write_requests.can_pop() && write.can_push()) { write.push(write_requests.pop()); }
+    if (write_data.can_pop() && write.can_push_data()) {
+        val beat = write_data.pop();
+        val _ = write.push_data(beat.data, beat.strb, beat.user);
+    }
+    if (read.can_pop() && read_results.can_push()) { read_results.push(read.pop()); }
+    if (write.can_pop() && write_results.can_push()) { write_results.push(write.pop()); }
+    write_results.end(); read_results.end();
+    write_data.end(); write_requests.end(); read_requests.end();
+}

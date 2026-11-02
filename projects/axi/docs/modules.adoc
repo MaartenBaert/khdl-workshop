@@ -1,0 +1,123 @@
+[[axi4-modules]]
+== Demonstration modules
+
+These modules show the APIs in complete designs, and the tests use them as
+devices under test. All of them default to `C=AxiDefault` and share the clock
+and reset contract in <<axi4-reset>>. Port names `bus`, `input`, and `output`
+below denote `Axi(C)` interface ports. Application channels use the generic
+`Channel(T)` interface. Source paths are relative to `projects/axi/rtl/`.
+
+[options="header",cols="1,1,3"]
+|===
+|Module |Uses |Purpose
+|<<axi4-pipeline,AxiPipeline>> |Channel bindings |Register slice on all five channels.
+|<<axi4-ram,AxiRam>> |Subordinate |Byte-addressed memory backed by a register array.
+|<<axi4-error,AxiError>> |Subordinate |Target that answers every request with DECERR.
+|<<axi4-router,AxiRouter>> |Subordinate and pooled Managers |Two-window address decoder with an error path.
+|<<axi4-copy,AxiCopy>> |Fixed-ID Manager |Memory-to-memory copy engine.
+|===
+
+[[axi4-pipeline]]
+=== AxiPipeline
+
+Source: `examples/pipeline.kh`. Ports: `input: Subordinate`, `output: Manager`.
+There are no parameters beyond `C`.
+
+The same generic forwarding operation connects all five channels in their
+respective directions and preserves every payload field. Each channel has a
+registered output slot and a receive skid slot. It takes one cycle from the
+first input transfer to the first output transfer. With continuously available
+traffic and an always-ready destination, it sustains one beat per cycle. READY
+is registered. This is a transport pipeline, with no address decoding, burst
+reconstruction, or transaction reordering.
+
+[[axi4-ram]]
+=== AxiRam
+
+Source: `examples/ram.kh`. Port: `bus: Subordinate`. Parameters:
+`memory_bytes=4096` (nonnegative), `capacity=2` (positive), and
+`queue_depth=2` (positive).
+
+Addresses are local byte offsets. The implementation is a register-array
+demonstration backend; block-RAM inference is not promised. Memory is
+unspecified after reset until written. Reads precede writes in the process, so
+a read and a write of the same byte at the same edge observe the old data.
+
+Read data populates the selected lanes and returns zero in other lanes. Writes
+honor WSTRB. Reads and writes use one range rule: a beat addresses the
+SIZE-aligned bytes that contain its address, and it is out of range if any of
+those bytes lies beyond `memory_bytes`, regardless of its lane mask or strobes.
+An out-of-range beat returns DECERR and neither reads nor writes memory: a read
+beat returns zero data, and a write beat changes no bytes. Write errors
+accumulate until B, and all remaining beats are drained. Earlier in-range beats
+of an errored write burst have already changed memory. `memory_bytes=0` implements an error
+destination without memory storage. Response USER is zero. Address attributes
+are accepted but do not select protection, cache, or QoS policies. Exclusive
+accesses behave as described in <<axi4-bursts>>.
+
+Separate request and write-completion queues let W progress independently of
+earlier B stalls, up to bounded capacity. `queue_depth=1` selects `Internal`
+storage and two or more selects `Fifo`. This changes scheduling latency while
+the application algorithm stays the same. A sufficiently buffered long burst
+sustains one read or write data beat per cycle. Response latency depends on
+queueing, context availability, and peer stalls; there is no fixed
+transaction-latency guarantee.
+
+[[axi4-error]]
+=== AxiError
+
+Source: `examples/error.kh`. Port: `bus: Subordinate`; parameter `capacity=2`.
+
+This wraps `AxiRam(C, memory_bytes=0)`. It returns every requested R beat with
+DECERR and consumes all W beats before returning a DECERR B response. It
+neither truncates bursts nor invents a timeout.
+
+[[axi4-router]]
+=== AxiRouter
+
+Source: `examples/router.kh`. Ports: `input: Subordinate`, `output0: Manager`,
+`output1: Manager`. Parameters: `capacity=3`, `queue_depth=2`, `base0=0`,
+`size0=4096`, `base1=4096`, `size1=4096`.
+
+The two positive-size address windows must be disjoint, 4 KiB aligned, and fit
+within `C.addr_width`. A request forwarded to a destination has that
+destination's base subtracted from its address. The router uses pooled Managers
+(<<axi4-pooled-manager>>) downstream, which preserve IDs and all attributes and
+USER fields. Because the routing boundaries are 4 KiB aligned, legal bursts
+stay within the window chosen by their start address. Unmapped accesses use an
+internal DECERR path that drains and completes the full burst.
+
+Responses are forwarded in upstream request order, separately for reads and
+writes. Each destination's read and write sides admit a new ID only after the
+current ID's transactions drain. Same-ID pipelining and concurrency across
+destinations remain possible. This policy avoids storing whole out-of-order
+response bursts. It is a router restriction, not a restriction of the Manager
+or Subordinate APIs. Head-of-line blocking and bounded-queue backpressure can
+therefore reduce throughput. Write completion scheduling is separate from W
+routing, so later W beats can advance while an earlier B response is stalled.
+`queue_depth` selects `Internal` or `Fifo` storage as in `AxiRam`; the
+algorithm assumes no fixed buffering latency.
+
+[[axi4-copy]]
+=== AxiCopy
+
+Source: `examples/copy.kh`. Ports: `bus: Manager`,
+`command: Channel(CopyCommand(C)).Receiver`,
+`result: Channel(CopyResult).Transmitter`. No parameters beyond `C`.
+
+A command contains byte addresses `source` and `destination`, a byte count
+`bytes`, and an eight-bit `tag`. A result contains the same `tag` and a two-bit
+`resp`. Source, destination, and size must be aligned to the bus width, lie
+within the address space, and not overlap. Zero-length commands are legal.
+Invalid commands are assertion errors before any bus activity. One command
+executes at a time, with one read and one write context, while results can
+remain buffered at the output.
+
+The copy is divided into INCR bursts of at most 256 beats that cross neither a
+source nor a destination 4 KiB boundary. Read data streams into W whenever both
+sides permit. An errored read beat is written with zero strobes. Read and write
+errors are recorded in the result, and a later error can replace an earlier
+response code. All issued transactions drain before the result is sent, so a
+failed copy can leave partially modified destination memory; no rollback is
+attempted. The implementation binds one read and one write endpoint, both with
+ID zero, default attributes, and no exclusive accesses.

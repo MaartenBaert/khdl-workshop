@@ -1,0 +1,66 @@
+[[reed-solomon-forney]]
+=== RsForney
+
+Source: `rtl/reedsolo_forney.kh`.
+
+==== Function and interfaces
+
+`RsForney` evaluates the formal derivative of the locator, applies the
+`fcr`-dependent adjustment, evaluates omega at each inverse error location,
+and multiplies by inverse denominators to produce XOR correction magnitudes.
+Arithmetic runs across all `t` slots in parallel; `unroll` chains algorithm
+steps within each slot. The inputs remain in the padded polynomial's
+coordinates established by `RsSyndromes` and `RsChien`. No per-error coordinate
+conversion is required when those stages agree.
+
+`input` is `RsTransaction(RsChienBlock(U, RS=RS)).Sink`; `output` is
+`RsTransaction(RsForneyBlock(U, RS=RS)).Source`. The stage preserves
+cycle/lane positions and `num_errors`, replacing locator/evaluator/inverse
+location arrays with `error_val[t]`. Incoming `failed` is retained. A zero
+denominator in an active slot additionally sets `failed`. Magnitudes in
+unused sentinel slots are not meaningful and need not be zero.
+
+[cols="1,1,3",options="header"]
+|===
+|Parameter |Default |Effect / constraint
+|RS |RsDefault |Code and field configuration, including `fcr`.
+|unroll |1 |`U_F` arithmetic steps per cycle; `1 <= U_F <= R`.
+|unroll_chien |1 |`U` of the incoming/outgoing position layout, independent of `U_F`.
+|===
+
+==== Timing and partial arithmetic cycles
+
+Let `h=(t +/ 2)`. There are `A=h-fcr+t+2` serial steps:
+one squaring step, `h-1` derivative steps, `1-fcr` adjustment steps,
+`t` omega/inversion steps, and one final multiplication. The stage takes
+`F=(A +/ U_F)` cycles. The final cycle guards steps beyond `A`;
+`U_F` need not divide `A`.
+
+The first step group executes on the input acceptance edge. An output can
+transfer `F` cycles later, and the next block can be accepted on that same
+edge. There is one working block and no additional queued input block.
+
+`RsDecoder` can instantiate multiple workers using
+`parallelism.forney_instances`. `RsRoundRobinDispatch` and `RsRoundRobinCollect`
+route whole frames in order, without adding a pipeline cycle. Every worker
+still takes `F` cycles; replication increases frame throughput while allowing
+a low `unroll` and a shorter chain of dependent field operations per cycle.
+
+.For t=3 and fcr=0, seven steps fit into two cycles; the eighth slot is skipped.
+[wavedrom]
+....
+{"signal":[
+  {"name":"clk","wave":"p..."},
+  {"name":"input.valid","wave":"10.."},
+  {"name":"input.ready","wave":"101."},
+  {"name":"arithmetic steps","wave":"23x.","data":["0..3","4..6, skip 7"]},
+  {"name":"output.valid","wave":"0.10"},
+  {"name":"output.ready","wave":"1..."},
+  {"name":"output block","wave":"x.2x","data":["result"]}
+],"head":{"text":"RsForney: RS(13,7), fcr=0, U_F=4, U=4","tick":0},"config":{"hscale":4}}
+....
+
+Changing `unroll_chien` changes only the position representation; it does
+not set arithmetic parallelism. Increasing `unroll` chains more field
+operations per cycle. The design does not support other `fcr` values or
+erasure-assisted decoding.

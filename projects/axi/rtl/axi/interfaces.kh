@@ -1,0 +1,62 @@
+import channel.endpoints.[ChannelSignals, transmitter_signals, receiver_signals, Transmitter, Receiver];
+import axi.types.AxiDefault;
+
+// One flat interface with typed payloads: nested interfaces are not yet supported
+// by KHDL. Binding objects below recover five reusable generic channel endpoints.
+pub interface Axi(C: type = AxiDefault) {
+    aw: C.Aw, awvalid: bool, awready: bool,
+    w: C.W, wvalid: bool, wready: bool,
+    b: C.B, bvalid: bool, bready: bool,
+    ar: C.Ar, arvalid: bool, arready: bool,
+    r: C.R, rvalid: bool, rready: bool,
+    view Manager {
+        aw: out, awvalid: out, awready: in,
+        w: out, wvalid: out, wready: in,
+        b: in, bvalid: in, bready: out,
+        ar: out, arvalid: out, arready: in,
+        r: in, rvalid: in, rready: out,
+    }
+    view Subordinate {
+        aw: in, awvalid: in, awready: out,
+        w: in, wvalid: in, wready: out,
+        b: out, bvalid: out, bready: in,
+        ar: in, arvalid: in, arready: out,
+        r: out, rvalid: out, rready: in,
+    }
+}
+
+// These are transport bindings, not the higher-level transaction API. Each
+// composite owns its children's lifecycle; application endpoints add tracking.
+pub struct ManagerChannels(C: type) {
+    aw: Transmitter(C.Aw), w: Transmitter(C.W), b: Receiver(C.B),
+    ar: Transmitter(C.Ar), r: Receiver(C.R),
+    fn begin(self) { self.aw.begin(); self.w.begin(); self.b.begin(); self.ar.begin(); self.r.begin(); }
+    fn end(self) { self.r.end(); self.ar.end(); self.b.end(); self.w.end(); self.aw.end(); }
+}
+
+pub struct SubordinateChannels(C: type) {
+    aw: Receiver(C.Aw), w: Receiver(C.W), b: Transmitter(C.B),
+    ar: Receiver(C.Ar), r: Transmitter(C.R),
+    fn begin(self) { self.aw.begin(); self.w.begin(); self.b.begin(); self.ar.begin(); self.r.begin(); }
+    fn end(self) { self.r.end(); self.ar.end(); self.b.end(); self.w.end(); self.aw.end(); }
+}
+
+pub fn manager_channels(C: type, bus: RefInterface(Axi(C))) -> ManagerChannels(C) {
+    return ManagerChannels(C).new(
+        aw=transmitter_signals(C.Aw, ChannelSignals(C.Aw).new(data=ref(deref(bus).aw), valid=ref(deref(bus).awvalid), ready=ref(deref(bus).awready))),
+        w=transmitter_signals(C.W, ChannelSignals(C.W).new(data=ref(deref(bus).w), valid=ref(deref(bus).wvalid), ready=ref(deref(bus).wready))),
+        b=receiver_signals(C.B, ChannelSignals(C.B).new(data=ref(deref(bus).b), valid=ref(deref(bus).bvalid), ready=ref(deref(bus).bready))),
+        ar=transmitter_signals(C.Ar, ChannelSignals(C.Ar).new(data=ref(deref(bus).ar), valid=ref(deref(bus).arvalid), ready=ref(deref(bus).arready))),
+        r=receiver_signals(C.R, ChannelSignals(C.R).new(data=ref(deref(bus).r), valid=ref(deref(bus).rvalid), ready=ref(deref(bus).rready))),
+    );
+}
+
+pub fn subordinate_channels(C: type, bus: RefInterface(Axi(C))) -> SubordinateChannels(C) {
+    return SubordinateChannels(C).new(
+        aw=receiver_signals(C.Aw, ChannelSignals(C.Aw).new(data=ref(deref(bus).aw), valid=ref(deref(bus).awvalid), ready=ref(deref(bus).awready))),
+        w=receiver_signals(C.W, ChannelSignals(C.W).new(data=ref(deref(bus).w), valid=ref(deref(bus).wvalid), ready=ref(deref(bus).wready))),
+        b=transmitter_signals(C.B, ChannelSignals(C.B).new(data=ref(deref(bus).b), valid=ref(deref(bus).bvalid), ready=ref(deref(bus).bready))),
+        ar=receiver_signals(C.Ar, ChannelSignals(C.Ar).new(data=ref(deref(bus).ar), valid=ref(deref(bus).arvalid), ready=ref(deref(bus).arready))),
+        r=transmitter_signals(C.R, ChannelSignals(C.R).new(data=ref(deref(bus).r), valid=ref(deref(bus).rvalid), ready=ref(deref(bus).rready))),
+    );
+}

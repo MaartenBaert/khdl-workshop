@@ -1,0 +1,173 @@
+// Structural port of reedsolo_decoder_ent.vhd and _rtl.vhd.
+// Reset is synchronous; r_ variables retain state across rising edges.
+import reedsolo_round_robin.[RsRoundRobinDispatch, RsRoundRobinCollect];
+import reedsolo_correction.[RsCorrection];
+import reedsolo_forney.[RsForney];
+import reedsolo_chien.[RsChien];
+import reedsolo_berlekamp.[RsBerlekamp];
+import reedsolo_syndromes.[RsSyndromes];
+import reedsolo.[RsDefault];
+import reedsolo_interfaces.[RsTransaction, RsStream, RsSyndromesBlock, RsBerlekampBlock, RsChienBlock, RsForneyBlock];
+import reedsolo_packet_fifo.[RsPacketFifo, RsFifoMemory, RsRamPort];
+
+// Elaboration-time parallelism choices; field/code parameters belong to RS.
+pub struct RsDecoderParallelism {
+    // Shared stream and error-position lane width.
+    stream_unroll: positive,
+    // Arithmetic iterations unrolled within each worker's clock cycle.
+    berlekamp_unroll: positive,
+    omegas_unroll: positive,
+    forney_unroll: positive,
+    // Replicate serial algorithms across frames without deeper unrolling.
+    berlekamp_instances: positive,
+    forney_instances: positive,
+}
+
+// The packet FIFO that carries message beats from RsSyndromes to RsCorrection,
+// past the block stages. Its depth counts stream beats and must hold at least
+// one message frame; a smaller FIFO than the default can limit throughput.
+pub struct RsMessageBuffer {
+    depth: positive,
+    memory: RsFifoMemory,
+    bypass: bool,
+}
+
+// Room for every frame the pipeline can hold at once: one each in RsSyndromes,
+// RsChien, and RsCorrection, and one per Berlekamp and Forney worker. Such a
+// FIFO never limits the decoder's throughput.
+pub fn full_message_buffer(RS: type, parallelism: RsDecoderParallelism) -> RsMessageBuffer {
+    val frames = 3 + parallelism.berlekamp_instances + parallelism.forney_instances;
+    return RsMessageBuffer.new(
+        depth=frames * (RS.k +/ parallelism.stream_unroll), memory=RsFifoMemory.Lut, bypass=true,
+    );
+}
+
+pub module RsDecoder(
+    parallelism: RsDecoderParallelism = RsDecoderParallelism.new(
+        stream_unroll=1, berlekamp_unroll=1, omegas_unroll=1, forney_unroll=1,
+        berlekamp_instances=1, forney_instances=1,
+    ),
+    buffered: bool = false,
+    RS: type = RsDefault,
+    message_buffer: RsMessageBuffer = full_message_buffer(RS, parallelism),
+    const {
+        assert(message_buffer.depth >= RS.k +/ parallelism.stream_unroll,
+            "RsDecoder message buffer must hold a complete message frame");
+    }
+) ports(
+    // clock and synchronous reset
+    clk: in clock,
+    sync(clk) {
+        rst: in bool,
+        // input stream
+        input: interface RsStream(parallelism.stream_unroll, decoded=false, RS=RS).Sink,
+        // output stream
+        output: interface RsStream(parallelism.stream_unroll, decoded=true, RS=RS).Source,
+        // external RAM for the message buffer, when it uses one
+        match (message_buffer.memory) {
+            .External(_) => {
+                message_ram: interface RsRamPort([parallelism.stream_unroll]RS.Sym, message_buffer.depth).Controller
+            }
+            _ => {}
+        }
+    }
+) {
+    wire syndromes_output: interface RsTransaction(RsSyndromesBlock(RS=RS));
+    wire message_input: interface RsTransaction([parallelism.stream_unroll]RS.Sym);
+    wire message_output: interface RsTransaction([parallelism.stream_unroll]RS.Sym);
+    wire message_cancel;
+    wire message_commit;
+    wire berlekamp_output: interface RsTransaction(RsBerlekampBlock(RS=RS));
+    wire chien_output: interface RsTransaction(RsChienBlock(parallelism.stream_unroll, RS=RS));
+    wire forney_output: interface RsTransaction(RsForneyBlock(parallelism.stream_unroll, RS=RS));
+
+    instance RsSyndromes(unroll=parallelism.stream_unroll, buffered=buffered, RS=RS) ports(
+        clk, rst, input, output=syndromes_output,
+        message=message_input, message_cancel, message_commit,
+    );
+    if (parallelism.berlekamp_instances == 1) {
+        instance RsBerlekamp(unroll=parallelism.berlekamp_unroll, RS=RS) ports(
+            clk, rst, input=syndromes_output, output=berlekamp_output,
+        );
+    } else {
+        for (i in 0..parallelism.berlekamp_instances) {
+            pub wire ident("berlekamp_input_{i}"): interface RsTransaction(RsSyndromesBlock(RS=RS));
+            pub wire ident("berlekamp_output_{i}"): interface RsTransaction(RsBerlekampBlock(RS=RS));
+            instance RsBerlekamp(unroll=parallelism.berlekamp_unroll, RS=RS) ports(
+                clk, rst,
+                input=ident("berlekamp_input_{i}"),
+                output=ident("berlekamp_output_{i}"),
+            );
+        }
+        instance RsRoundRobinDispatch(
+            T=RsSyndromesBlock(RS=RS),
+            count=parallelism.berlekamp_instances,
+        ) ports(
+            clk, rst, input=syndromes_output,
+            for (i in 0..parallelism.berlekamp_instances) {
+                ident("output_{i}")=ident("berlekamp_input_{i}"),
+            }
+        );
+        instance RsRoundRobinCollect(
+            T=RsBerlekampBlock(RS=RS),
+            count=parallelism.berlekamp_instances,
+        ) ports(
+            clk, rst, output=berlekamp_output,
+            for (i in 0..parallelism.berlekamp_instances) {
+                ident("input_{i}")=ident("berlekamp_output_{i}"),
+            }
+        );
+    }
+    instance RsChien(unroll_omegas=parallelism.omegas_unroll, unroll_chien=parallelism.stream_unroll, RS=RS) ports(
+        clk, rst, input=berlekamp_output, output=chien_output,
+    );
+    if (parallelism.forney_instances == 1) {
+        instance RsForney(unroll=parallelism.forney_unroll, unroll_chien=parallelism.stream_unroll, RS=RS) ports(
+            clk, rst, input=chien_output, output=forney_output,
+        );
+    } else {
+        for (i in 0..parallelism.forney_instances) {
+            pub wire ident("forney_input_{i}"): interface RsTransaction(RsChienBlock(parallelism.stream_unroll, RS=RS));
+            pub wire ident("forney_output_{i}"): interface RsTransaction(RsForneyBlock(parallelism.stream_unroll, RS=RS));
+            instance RsForney(unroll=parallelism.forney_unroll, unroll_chien=parallelism.stream_unroll, RS=RS) ports(
+                clk, rst,
+                input=ident("forney_input_{i}"),
+                output=ident("forney_output_{i}"),
+            );
+        }
+        instance RsRoundRobinDispatch(
+            T=RsChienBlock(parallelism.stream_unroll, RS=RS),
+            count=parallelism.forney_instances,
+        ) ports(
+            clk, rst, input=chien_output,
+            for (i in 0..parallelism.forney_instances) {
+                ident("output_{i}")=ident("forney_input_{i}"),
+            }
+        );
+        instance RsRoundRobinCollect(
+            T=RsForneyBlock(parallelism.stream_unroll, RS=RS),
+            count=parallelism.forney_instances,
+        ) ports(
+            clk, rst, output=forney_output,
+            for (i in 0..parallelism.forney_instances) {
+                ident("input_{i}")=ident("forney_output_{i}"),
+            }
+        );
+    }
+    instance RsPacketFifo(
+        T=[parallelism.stream_unroll]RS.Sym,
+        depth=message_buffer.depth,
+        memory=message_buffer.memory,
+        bypass=message_buffer.bypass,
+    ) ports(
+        clk, rst, input=message_input, cancel=message_cancel, commit=message_commit,
+        output=message_output,
+        match (message_buffer.memory) {
+            .External(_) => { ram=message_ram, }
+            _ => {}
+        }
+    );
+    instance RsCorrection(unroll=parallelism.stream_unroll, RS=RS) ports(
+        clk, rst, input=forney_output, message=message_output, output,
+    );
+}

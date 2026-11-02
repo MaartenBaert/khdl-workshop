@@ -1,0 +1,199 @@
+= Pipelined FFA FIR filter
+:encoding: UTF-8
+:lang: en
+
+[[fir-overview]]
+== Overview
+
+`fir.Fir` is a signed fixed-point FIR with radix-2 fast FIR algorithm (FFA)
+decomposition, systolic leaves, and elastic ready/valid stages. It supports odd
+tap counts and odd numbers of samples per beat. Each accepted input beat
+produces one output beat unless reset or coefficient clear discards unfinished
+work. Output can drain without another input beat.
+
+For a stream containing N samples, the numerical result is the first N samples
+of full linear convolution, initially using zero history. Lane zero is earliest.
+There are no partial beats or tail-flush input requirements. An invalid cycle
+or a stall does not advance sample time or insert zeros.
+
+[[fir-quick-start]]
+== Build and use
+
+From the repository root:
+
+----
+.venv/bin/python -m projects.fir.tools.compile --check
+.venv/bin/python -m projects.fir.tools.compile --taps 9 --parallel 7 --ffa-depth 2 --taps-per-stage 2
+.venv/bin/pytest projects/fir/tests --basetemp=build/fir/pytest
+----
+
+The export defaults to `build/fir/verilog/fir.v`; `--out` changes it. Use
+`TMPDIR` on the main disk for large compiler runs as described in the root
+README. This project has its own `rtl/khdl.toml` and imports no other project's
+KHDL. Its FIFO-style stream APIs are local adaptations of the AXI project's
+endpoint pattern.
+
+Example instantiation:
+
+----
+import fir.Fir;
+import streams.Stream;
+
+pub module Filter ports(
+    clk: in clock,
+    sync(clk) {
+        rst: in bool,
+        input: interface Stream([7]int(8)).Sink,
+        output: interface Stream([7]int(10), true).Source,
+        coeff_value: in int(7), coeff_push: in bool, coeff_clear: in bool,
+    }
+) {
+    instance Fir(
+        input_w=8, input_f=3, output_w=10, output_f=3,
+        coeff_w=7, coeff_f=2, taps=9, parallel=7, ffa_depth=2,
+        taps_per_stage=2,
+    ) ports(clk, rst, input, output, coeff_value, coeff_push, coeff_clear);
+}
+----
+
+[[fir-parameters]]
+== Parameters
+
+[cols="1,1,3",options="header"]
+|===
+| Parameter | Default | Contract
+| `input_w`, `input_f` | 16, 15 | Signed input width and nonnegative fractional-bit count.
+| `output_w`, `output_f` | 16, 15 | Signed output width and fractional-bit count.
+| `coeff_w`, `coeff_f` | 16, 15 | Signed coefficient width and fractional-bit count.
+| `taps` | 16 | Positive number of coefficients.
+| `parallel` | 4 | Positive number of consecutive samples on each interface beat.
+| `ffa_depth` | 2 | Nonnegative radix-2 recursion depth D; `2**D <= min(taps, parallel)`.
+| `taps_per_stage` | 4 | Positive maximum number of encoded leaf taps in one systolic arithmetic step.
+| `pipeline_steps` | `()` | Compile-time sequence of positive step counts per elastic clock stage; empty selects one step per stage.
+|===
+
+Let B=2^D^ and M=ceil(taps/B). There are ceil(M/taps_per_stage) leaf steps.
+The complete algorithm consists of alignment, D encoding steps, the leaf steps,
+D decoding steps, and quantization. `pipeline_steps` must sum to this count.
+For nine taps, seven samples, depth two, and two taps per leaf step, the count
+is eight. `(8,)` groups all arithmetic into one elastic stage; `(3,2,3)` uses
+three. Such grouping changes clock latency and combinational depth, not sample
+values. Every configuration retains one-beat-per-clock steady-state capability
+with valid input, ready output, and loaded coefficients. No clock-frequency
+guarantee is implied.
+
+[[fir-ports]]
+== Interfaces and numerical behavior
+
+The input uses `Stream([parallel]int(input_w)).Sink`; the output uses
+`Stream([parallel]int(output_w), true).Source`. The latter adds the beat-level
+`clipped` flag. Flattened Verilog signal names are `input_samples`,
+`input_valid`, `input_ready`, `output_samples`, `output_valid`, `output_ready`,
+and `output_clipped`. Each sample array is packed into one Verilog vector, with
+lane zero in the least-significant sample field.
+
+A transfer occurs on a rising edge with valid and ready asserted. The source
+holds valid, samples, and output clipping status unchanged while stalled.
+`clk` and active-high synchronous `rst` follow the Reed–Solomon convention.
+Reset cancels all traffic and invalidates coefficients; inputs during reset
+are dropped. Payloads when valid is false are unspecified.
+
+All intermediate operations are exact integers with sufficient ranges. If
+r=input_f+coeff_f-output_f is positive, final rounding is
+`floor((sum + 2**(r-1)) / 2**r)`. Negative ties round toward positive infinity:
+-1.5 becomes -1. For negative r, left scaling is exact. The result is then
+clamped to the signed output range. `clipped` is true if any rounded/scaled lane
+needed this clamp, and false otherwise. Depth and pipeline grouping do not
+change this computation.
+
+[[fir-coefficients]]
+== Coefficient loading and clear
+
+Push exactly `taps` values h[0], h[1], ... using `coeff_push`; gaps are allowed.
+The shift-register loader accepts one value per asserted cycle. Clear is
+required before replacement. Reset also establishes the cleared state.
+`coeff_clear` followed by `coeff_push` on the same edge clears first, then
+loads that cycle's value as the new h[0]. Reset takes precedence over both.
+A clear at any loading or filtering state abandons the old load; repeated
+clears are allowed.
+
+Input ready remains low until a complete encoded coefficient set is available.
+Coefficients are encoded a radix group at a time during loading using the same
+transform as the input. Clearing the small group buffer after each full group
+makes the final short group's unused entries zero. Finalization requires no
+second traversal of the taps and no padding-zero cycles. After the last push,
+coefficient readiness enables registered input ready on the following cycle;
+an active clear-flush interval or blocked ordered marker can extend that wait.
+
+Clear preserves stream protocol:
+
+* No new filtering work is admitted while the input is disabled. A beat
+  handshaken on the clear edge can belong to discarded old work.
+* Queued partial results that still require coefficient reads are popped and
+  discarded. Coefficient-dependent stage state is cleared synchronously by
+  the algorithm functions, without resetting stream endpoints.
+* Already completed products and decoding/quantization results remain queued.
+  In particular, a stalled valid external output remains unchanged until accepted.
+* A clear marker follows the retained products and clears downstream decoder
+  history in order. New work follows that marker, so coefficient sets and
+  histories cannot mix.
+
+The private coefficient-dependent transport uses a conservative three-cycle
+flush interval. All partial stages flush concurrently. Existing output slots
+retire through their consumers; the interval does not grow with the tap count.
+Coefficient loading can overlap draining retained old results. Output
+backpressure can delay acceptance of new samples.
+
+[[fir-architecture]]
+== Phase alignment and systolic leaves
+
+The input scheduler tracks position modulo B. If a beat starts within a radix
+group, it prepends that group's saved raw prefix. It provisionally zero-fills
+the last group and passes the starting phase and complete-group count through
+the pipeline. Each leaf and decoder step evaluates the provisional last group
+but commits its history only through complete groups. The next beat recomputes
+the unfinished group, discarding outputs already emitted. Causality ensures
+that the emitted prefix cannot depend on the provisionally filled future.
+
+For P=parallel and g=gcd(P,B), packet capacity is ceil((P+B-g)/B) radix groups.
+This is at most one group beyond ordinary padding. It does not aggregate input
+beats, and the decoder always selects exactly P output samples.
+
+Phase alignment and output selection use a barrel network over the reachable
+offsets, with fixed sample slices at each level. Leaf history and decoder carry
+updates select between at most two fixed positions. This exposes the legal
+connections directly to synthesis while preserving the same sample sequence.
+Generic helpers preserve each window's element type and allow empty histories.
+
+Each FFA encoding level splits even and odd subsequences into even,
+even+odd, and odd. The inverse product transform uses additions, subtractions,
+and a one-sample carry; there is no intermediate quantization. Leaf functions
+implement convolution from the last coefficient group toward the first. Each
+earlier group adds its own convolution to the previous partial result delayed
+by that group's tap count in the leaf sample domain. Clock pipeline latency is
+separate from this mathematical delay.
+
+`steps.kh` returns typed function closures. `fir.kh` constructs compile-time
+arrays of these functions and boundary types. `pipeline.Group` applies a
+selected consecutive function range through one canonical call site per step,
+using project-local receiver, internal storage, and transmitter APIs. Functions
+own their history and commit only on a successful stage operation. They handle
+functional clear independently of their grouping into clock stages.
+
+[[fir-verification]]
+== Verification and limits
+
+The tests compare native Verilator simulation with an independent scalar
+integer-convolution reference. They cover odd dimensions, phase cycles,
+single-tap/scalar cases, rounding, signed extrema, saturation, stalls, bubbles,
+output draining, pipeline regrouping, throughput, coefficient gaps, and
+clear/reload while outputs are stalled. Concrete check roots cover larger
+specializations and appear both in the Python tool and the LSP roots.
+
+A generic-cell Yosys sweep confirms that the arithmetic bank is shared across
+reachable phases. Unaligned parallel widths still need extra group capacity
+and phase selectors; unused padded operations can be optimized away. These
+experiments do not establish target DSP mapping,
+physical area, or clock frequency. Runtime API assertions retain the compiler's
+simulation-task lowering; synthesis experiments remove those tasks from
+temporary exports.

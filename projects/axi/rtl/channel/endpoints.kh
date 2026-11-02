@@ -1,0 +1,121 @@
+// Channel roles describe data flow, independently of AXI transaction roles.
+pub interface Channel(T: type) {
+    data: T, valid: bool, ready: bool,
+    view Transmitter { data: out, valid: out, ready: in }
+    view Receiver { data: in, valid: in, ready: out }
+}
+
+// An interface-independent binding lets composite buses reuse the same channel
+// engine. KHDL interfaces cannot currently contain other interfaces. These
+// references retain the target signals' directions, domains and ownership.
+pub struct ChannelSignals(T: type) {
+    ref data: T,
+    ref valid: bool,
+    ref ready: bool,
+}
+
+pub fn channel_signals(T: type, channel: RefInterface(Channel(T))) -> ChannelSignals(T) {
+    return ChannelSignals(T).new(
+        data=ref(deref(channel).data), valid=ref(deref(channel).valid),
+        ready=ref(deref(channel).ready),
+    );
+}
+
+// API objects hold references to persistent state created by the binding
+// functions below. All operations belong to one clocked process; begin/end
+// delimit that process's transaction-level work for each cycle.
+// TODO(khdl#38): replace per-cycle scratch refs with ordinary fields
+// once mixed hardware/reference struct updates work. Mutating methods will
+// also need ref self and queue-array callers need stepped receiver support.
+// Persistent payload/protocol/queue state must remain register-backed.
+pub struct Transmitter(T: type) {
+    channel: ChannelSignals(T),
+    // TODO: per-cycle lifecycle field; retain ref until the API migration above.
+    ref active: bool,
+
+    fn begin(self) {
+        assert(!self.active, "Transmitter.begin(): previous cycle not ended");
+        self.active = true;
+        if (self.channel.valid && self.channel.ready) {
+            self.channel.valid = false;
+        }
+    }
+    fn end(self) {
+        assert(self.active, "Transmitter.end(): begin required");
+        self.active = false;
+    }
+    fn can_push(self) -> bool {
+        assert(self.active, "Transmitter.can_push(): begin required");
+        return !self.channel.valid;
+    }
+    fn push(self, data: T) {
+        val available = self.can_push();
+        assert(available, "Transmitter.push(): can_push required");
+        if (available) {
+            self.channel.data = data;
+            self.channel.valid = true;
+        }
+    }
+}
+
+pub fn transmitter(T: type, channel: RefInterface(Channel(T))) -> Transmitter(T) {
+    return transmitter_signals(T, channel_signals(T, channel));
+}
+
+pub fn transmitter_signals(T: type, channel: ChannelSignals(T)) -> Transmitter(T) {
+    // TODO: ordinary active=false field, not persistent hardware state.
+    reg r_active: bool = false;
+    val tx = Transmitter(T).new(channel=channel, active=ref(r_active));
+    reg wire tx.channel.data = undef;
+    reg wire tx.channel.valid = false;
+    return tx;
+}
+
+pub struct Receiver(T: type) {
+    channel: ChannelSignals(T),
+    ref slot: T,
+    // TODO: ordinary per-cycle lifecycle field (see khdl#38 above).
+    ref active: bool,
+
+    fn begin(self) {
+        assert(!self.active, "Receiver.begin(): previous cycle not ended");
+        self.active = true;
+        if (self.channel.ready && self.channel.valid) {
+            self.slot = self.channel.data;
+            self.channel.ready = false;
+        }
+    }
+    fn end(self) {
+        assert(self.active, "Receiver.end(): begin required");
+        self.active = false;
+    }
+    fn can_pop(self) -> bool {
+        assert(self.active, "Receiver.can_pop(): begin required");
+        return !self.channel.ready;
+    }
+    fn peek(self) -> T {
+        val available = self.can_pop();
+        assert(available, "Receiver.peek(): can_pop required");
+        var data: T = undef;
+        if (available) { data = self.slot; }
+        return data;
+    }
+    fn pop(self) -> T {
+        val data = self.peek();
+        if (self.can_pop()) { self.channel.ready = true; }
+        return data;
+    }
+}
+
+pub fn receiver(T: type, channel: RefInterface(Channel(T))) -> Receiver(T) {
+    return receiver_signals(T, channel_signals(T, channel));
+}
+
+pub fn receiver_signals(T: type, channel: ChannelSignals(T)) -> Receiver(T) {
+    reg r_slot: T = undef;
+    // TODO: ordinary active=false field; r_slot remains persistent skid storage.
+    reg r_active: bool = false;
+    val rx = Receiver(T).new(channel=channel, slot=ref(r_slot), active=ref(r_active));
+    reg wire rx.channel.ready = true;
+    return rx;
+}

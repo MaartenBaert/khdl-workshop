@@ -1,0 +1,48 @@
+// Shared AXI4 address/lane arithmetic. All runtime wrapping below is a
+// power-of-two bit mask; no arbitrary runtime modulo is required.
+pub fn valid_request(C: type, request: any) -> bool {
+    val bytes = 1 << request.size;
+    val count = request.len + 1;
+    val aligned = request.addr - (request.addr & (bytes - 1));
+    var valid = request.size <= C.size && bytes <= 2**C.addr_width && request.burst <= C.wrap;
+    if (request.burst == C.fixed) { valid = valid && count <= 16; }
+    if (request.burst == C.wrap) {
+        valid = valid && (count == 2 || count == 4 || count == 8 || count == 16)
+            && (request.addr & (bytes - 1)) == 0 && count * bytes <= 2**C.addr_width;
+    }
+    if (request.burst == C.incr) {
+        valid = valid && (aligned & 4095) + count * bytes <= 4096
+            && aligned + count * bytes <= 2**C.addr_width;
+    }
+    if (request.lock) {
+        valid = valid && (count == 1 || count == 2 || count == 4 || count == 8 || count == 16)
+            && count * bytes <= 128 && (request.addr & (count * bytes - 1)) == 0;
+    }
+    return valid;
+}
+
+pub fn beat_address(C: type, request: any, beat: uint(0..256)) -> C.Addr {
+    val bytes = 1 << request.size;
+    var address = request.addr;
+    if (request.burst == C.incr && beat != 0) {
+        address = request.addr - (request.addr & (bytes - 1)) + beat * bytes;
+    }
+    if (request.burst == C.wrap) {
+        val mask = (request.len + 1) * bytes - 1;
+        address = request.addr - (request.addr & mask) + ((request.addr + beat * bytes) & mask);
+    }
+    return address & (2**C.addr_width - 1);
+}
+
+pub fn lane_mask(C: type, request: any, beat: uint(0..256)) -> C.Strobe {
+    val address = beat_address(C, request, beat);
+    val bytes = 1 << request.size;
+    val lower = address & (C.bytes - 1);
+    val upper = lower - (address & (bytes - 1)) + bytes;
+    var strobes: C.Strobe = 0;
+    for (lane in 0..C.bytes) {
+        val selected = lower <= lane && lane < upper;
+        if (selected) { strobes = strobes | (1 << lane); }
+    }
+    return strobes;
+}

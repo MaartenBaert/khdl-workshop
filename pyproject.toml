@@ -1,0 +1,18 @@
+[project]
+name = "khdl-workshop"
+version = "0.1.0"
+requires-python = ">=3.12,<3.15"
+license = "MIT"
+license-files = ["LICENCE.txt"]
+dependencies = ["khdl", "numpy>=2", "pytest>=9"]
+
+[project.optional-dependencies]
+axi-test = ["cocotb>=2,<3", "cocotbext-axi>=0.1.28,<0.2"]
+
+[tool.uv.sources]
+khdl = { path = "khdl/rust/khdl_python", editable = true }
+
+[tool.pytest.ini_options]
+addopts = "--tb=short --import-mode=importlib"
+testpaths = ["projects"]
+pythonpath = ["."]

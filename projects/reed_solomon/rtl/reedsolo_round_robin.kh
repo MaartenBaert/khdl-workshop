@@ -1,0 +1,72 @@
+// Ordered ready/valid transaction routing. Payload/handshake paths have no
+// registers; counters advance only on transfers and restart at worker zero.
+import reedsolo_interfaces.[RsTransaction];
+
+pub module RsRoundRobinDispatch(T: type, count: positive) ports(
+    clk: in clock,
+    sync(clk) {
+        rst: in bool,
+        input: interface RsTransaction(T).Sink,
+        for (i in 0..count) {
+            ident("output_{i}"): interface RsTransaction(T).Source,
+        }
+    }
+) {
+    wire r_select: sync(clk) uint(0..count);
+    comb {
+        input.ready = false;
+        for (i in 0..count) {
+            ident("output_{i}").data = input.data;
+            ident("output_{i}").valid = input.valid && r_select == i;
+            if (r_select == i) {
+                input.ready = ident("output_{i}").ready;
+            }
+        }
+    }
+    clocked(clk, sync rst) {
+        reg wire r_select = 0;
+        if (input.valid && input.ready) {
+            if (r_select == count - 1) {
+                r_select = 0;
+            } else {
+                r_select = r_select + 1;
+            }
+        }
+    }
+}
+
+// This is an ordered collector, not a ready-first arbiter: wait for the next
+// worker in dispatch order, even when a later worker has already completed.
+pub module RsRoundRobinCollect(T: type, count: positive) ports(
+    clk: in clock,
+    sync(clk) {
+        rst: in bool,
+        for (i in 0..count) {
+            ident("input_{i}"): interface RsTransaction(T).Sink,
+        }
+        output: interface RsTransaction(T).Source,
+    }
+) {
+    wire r_select: sync(clk) uint(0..count);
+    comb {
+        output.data = undef;
+        output.valid = false;
+        for (i in 0..count) {
+            ident("input_{i}").ready = output.ready && r_select == i;
+            if (r_select == i) {
+                output.data = ident("input_{i}").data;
+                output.valid = ident("input_{i}").valid;
+            }
+        }
+    }
+    clocked(clk, sync rst) {
+        reg wire r_select = 0;
+        if (output.valid && output.ready) {
+            if (r_select == count - 1) {
+                r_select = 0;
+            } else {
+                r_select = r_select + 1;
+            }
+        }
+    }
+}

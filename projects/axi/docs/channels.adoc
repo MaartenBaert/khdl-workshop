@@ -1,0 +1,187 @@
+[[axi-channel-reference]]
+== Channel layer reference
+
+Sources: `rtl/channel/endpoints.kh` and `rtl/channel/buffers.kh`.
+
+Every higher layer is built from the primitives in this chapter. A generic
+`Channel(T)` interface carries `data: T`, `valid`, and the reverse `ready`. Its
+`Transmitter` view drives data and valid; its `Receiver` view drives ready.
+`T` can be a scalar, an array, a struct, or a singleton integer with zero
+payload bits. Applications that only use the AXI4 transaction APIs need this
+chapter mainly to understand `Internal` and `Fifo` storage, which the APIs and
+demonstration modules use for local queues.
+
+All objects follow <<axi-programming-model>>.
+
+[[axi-channel-methods]]
+=== Objects and operations
+
+Lowercase binding functions return the corresponding UpperCamelCase API objects:
+`transmitter(T, ref(output))`, `receiver(T, ref(input))`, `internal(T)`, and
+`fifo(T, depth=2)`. `storage(T, depth=1)` returns `internal(T)` for depth one
+and `fifo(T, depth)` otherwise.
+
+[options="header",cols="1,2,2"]
+|===
+|API |Operations |Meaning
+|All |`begin()`, `end()` |Delimit one cycle's transaction-level work.
+|Transmitter |`can_push()`, `push(data)` |Query and fill the output slot.
+|Receiver |`can_pop()`, `peek()`, `pop()` |Query, inspect, and consume the skid slot.
+|Internal |`can_push()`, `can_pop()`, `push(data)`, `peek()`, `pop()` |One slot with immediate push/pop chaining.
+|Fifo |`can_push()`, `can_pop()`, `push(data)`, `peek()`, `pop()` |A queue with separate push and pop sides.
+|===
+
+`push`, `pop`, and `peek` assert their availability preconditions, and `peek`
+does not consume data. Operations also check that the lifecycle is active:
+repeated begin, repeated end, and a missing end before the next begin are
+errors. The general rules for these checks are in
+<<axi-programming-operations>>.
+
+[[axi-channel-endpoints]]
+=== Transmitter and Receiver
+
+A Transmitter has one slot: its registered output payload, occupied while valid
+is true. `begin()` clears valid if the previous output transferred, and
+`push()` stores a payload and sets valid. A slot freed at an edge can be
+refilled before the next edge, and a subsequent `can_push()` in the same cycle
+sees that push immediately.
+
+A Receiver has one skid slot, occupied while ready is false. `begin()`
+captures an input transfer into the slot and clears ready. `can_pop()` and
+`peek()` see the captured payload immediately, and `pop()` returns it and sets
+ready. A further `can_pop()` in the same cycle sees the empty slot. A full
+Receiver cannot accept a new input at an edge where its ready was low before
+the edge; that input can transfer at a later edge. In the relay
+(<<axi-channel-contract>>), the Transmitter slot lets the relay keep delivering
+beats while the Receiver resumes accepting input.
+
+The example process uses active-high synchronous reset. After a reset edge,
+valid is false and ready is true. Input transfers during reset are accepted and
+immediately dropped. This is the chosen generic API convention, not an AXI
+reset-signal convention. Payload registers reset to `undef` and are not
+observed while empty or invalid.
+
+Application code does not drive valid or ready. The endpoint objects own those
+registered signals and hold stalled data automatically. The current relay
+implementation has one cycle of latency from first input to first output, two
+payload slots in total, and sustains one beat per cycle. Its ready path is
+registered, with no combinational propagation of downstream ready. Two relay
+modules compose under the same transaction rules.
+
+[[axi-channel-timing]]
+==== Timing example
+
+The waveform illustrates the current relay implementation, not a requirement on
+transaction-level application code. A fills the Transmitter. B fills the
+Receiver while A is stalled. Once the output resumes, A, B, and C transfer
+without an output bubble.
+
+[wavedrom]
+....
+{
+  "signal": [
+    {"name":"clk", "wave":"p......."},
+    {"name":"rst", "wave":"10......"},
+    {"name":"input.valid", "wave":"01....0."},
+    {"name":"input.ready", "wave":"x1.0.1.."},
+    {"name":"input.data", "wave":"x===..x.", "data":["A","B","C"]},
+    {"name":"output.valid", "wave":"0.1....0"},
+    {"name":"output.ready", "wave":"0...1..."},
+    {"name":"output.data", "wave":"x.=..==x", "data":["A","B","C"]}
+  ],
+  "head":{"text":"Sampled at rising edges; an edge's updates appear in the next column"}
+}
+....
+
+[[axi-channel-storage-contract]]
+=== Storage objects and cross-side visibility
+
+`Internal` and `Fifo` are local storage objects with both a push side and a pop
+side. They share one storage contract: an operation's effect is visible
+immediately on its own side, so a push consumes that cycle's push opportunity
+and a pop consumes that cycle's pop opportunity. The contract does not specify
+whether an operation is visible on the _other_ side in the same cycle.
+Applications that must work with either implementation therefore must not
+require a push to enable a pop, or a pop to enable a push, in the same cycle.
+Changing storage or loop order can change latency, occupancy, and recovery
+throughput while the transactions stay the same.
+
+[[axi-channel-internal]]
+==== Internal: one slot with chaining
+
+`internal(T)` creates one payload register and a valid flag, reset to false.
+There are no occupancy counters, queue indices, or availability snapshots.
+`begin()` and `end()` only delimit the lifecycle. A push writes the slot and sets
+valid; a pop returns the slot and clears valid. A peek leaves valid unchanged.
+
+Operations are immediately visible on both sides: pushing makes data available
+to a subsequent pop, and popping makes space for a subsequent push. This permits
+combinational forwarding through several `Internal` stages in one process,
+including within a loop. Correctness still follows from checking availability
+before every operation. Chaining lengthens the combinational path; use `Fifo`
+where a timing boundary is needed instead. `Internal` is the default
+lightweight stage, and the Manager's pending slots use it to forward new
+requests in the same cycle.
+
+[[axi-channel-fifo]]
+==== Fifo: independent sides
+
+`Fifo` deliberately promises no cross-side visibility:
+
+* A push immediately consumes that cycle's push opportunity.
+* A pop immediately consumes that cycle's pop opportunity.
+* A push need not make data available to pop in the same cycle.
+* A pop need not make space available to push in the same cycle.
+
+The current implementation supports at most one push and one pop per cycle. It
+snapshots both availability predicates at `begin()`. It also snapshots the head
+payload before application writes, avoiding a write-through multiplexer path
+from a push to a later pop. `end()` commits the occupancy change. A queue that
+begins the cycle empty cannot pop newly pushed data until a later cycle, and a
+queue that begins full cannot accept data merely because it is popped during
+that cycle.
+
+The depth is at least two and defaults to two. An intermediate occupancy permits
+a simultaneous push and pop, and sustains one beat per cycle without same-cycle
+feedback between the sides. Indices wrap with guarded terminal cases rather than
+runtime modulo; non-power-of-two depths are tested too. The interface leaves
+room for other buffering implementations with different latency and cross-side
+visibility.
+
+[[axi-channel-relay]]
+==== Composing storage: the Relay example
+
+`Relay(stages=N, reverse=..., depth=1)` in `rtl/channel/examples.kh` chains
+`N` storage stages between a Receiver and a Transmitter. It uses lightweight
+`Internal` stages by default, and a depth of two or more selects `Fifo` stages.
+Both run the same generic `forward(input, output)` operation along each edge of
+the chain. `reverse` selects whether the edges are visited from the input end
+or from the output end. Neither order assumes same-cycle
+cross-side visibility, so changing the storage requires no change to the
+application's timing assumptions.
+
+[[axi-ref-self-prototype]]
+=== Reference-receiver prototype
+
+`rtl/channel/ref_self.kh` demonstrates the limited `fn method(ref self)`
+compiler feature without changing the existing queue-array API. Its relay owns
+two mutable endpoint variables. Lifecycle flags are ordinary per-cycle fields;
+only protocol and skid storage persist across cycles. The forwarding helper
+receives explicit references and operates on the original objects.
+
+Its transaction behavior, reset, stalls, and sustained one-beat-per-cycle rate
+are tested alongside the existing relay. The export contains no active-state
+registers. Per-cycle lifecycle state cannot detect a missing end in the next
+cycle; constant misuse may instead be diagnosed during elaboration.
+
+The compiler currently rejects indexed or nested storage targets and temporary
+receivers. Hardware-valued ordinary fields in structs that contain references
+also hit an existing partial-assignment limitation (https://github.com/khdl-lang/khdl/issues/38[khdl#38]). FIFO head and
+availability migration therefore remains a separate follow-up. The limitation
+is unintended and expected to be fixed. Until then the
+production API uses register references for those per-cycle snapshots, and
+source TODOs mark them and the lifecycle flags for replacement with ordinary
+fields. Payload and skid storage, valid/ready, queue indices, and occupancy
+remain persistent state. Replacing the lifecycle registers also removes the
+extra next-cycle missing-end diagnostic; the required unconditional begin/end
+discipline remains.

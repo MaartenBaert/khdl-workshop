@@ -1,0 +1,159 @@
+// Structural port of reedsolo_syndromes_ent.vhd and _rtl.vhd.
+// Reset is synchronous; r_ variables retain state across rising edges.
+import reedsolo.[RsDefault];
+import reedsolo_interfaces.[RsTransaction, RsStream, RsSyndromesBlock];
+
+pub module RsSyndromes(unroll: positive = 1, buffered: bool = false, RS: type = RsDefault) ports(
+    // clock and synchronous reset
+    clk: in clock,
+    sync(clk) {
+        rst: in bool,
+        // inputs
+        input: interface RsStream(unroll, decoded=false, RS=RS).Sink,
+        // outputs
+        output: interface RsTransaction(RsSyndromesBlock(RS=RS)).Source,
+        // Message beats for a packet FIFO, in stream order, committed when
+        // the frame is complete and cancelled when it is malformed.
+        message: interface RsTransaction([unroll]RS.Sym).Source,
+        message_cancel: out bool,
+        message_commit: out bool,
+    }
+) {
+    const c_message_cycles = RS.k +/ unroll;
+    const c_codeword_cycles = RS.n +/ unroll;
+    const c_codeword_padding = c_codeword_cycles * unroll - RS.n;
+    const c_table = generate_table(RS, unroll);
+    wire r_input_ready_cond: sync(clk) bool;
+    wire r_input_ready_uncond: sync(clk) bool;
+    wire r_message_beat: sync(clk) bool;
+    comb {
+        // Without the holding register, a message beat or a final beat is
+        // accepted only while the message output register is free.
+        var message_free = true;
+        if (!buffered) {
+            message_free = !(r_message_beat || input.last) || !message.valid || message.ready;
+        }
+        input.ready = ((r_input_ready_cond && output.ready) || r_input_ready_uncond) && message_free;
+    }
+    clocked(clk, sync rst) {
+        reg wire output.data = RsSyndromesBlock(RS=RS).new(
+            syndromes=[RS.sym_zero] * (2 * RS.t),
+        );
+        reg wire output.valid = false;
+        reg wire message.data = undef;
+        reg wire message.valid = false;
+        reg wire message_cancel = false;
+        reg wire message_commit = false;
+        reg wire r_input_ready_cond = !buffered;
+        reg wire r_input_ready_uncond = true;
+        reg wire r_message_beat = true;
+        // input holding registers (only when buffered)
+        reg r_fc_input_data: [unroll]RS.Sym = [RS.sym_zero] * unroll;
+        reg r_fc_input_last: bool = false;
+        reg r_fc_input_valid: bool = false;
+        // output registers
+        reg r_fc_output_valid: bool = false;
+        // registers for processing
+        reg r_syndromes: [2 * RS.t]RS.Sym = [RS.sym_zero] * (2 * RS.t);
+        // status registers
+        reg r_processing: bool = false;
+        reg r_num_words: uint(0..=c_codeword_cycles) = 0;
+        // flow control
+        if (!buffered) {
+            r_fc_input_data = input.data;
+            r_fc_input_last = input.last;
+            r_fc_input_valid = input.valid;
+        } else {
+            if (input.valid && !r_fc_input_valid) {
+                r_fc_input_data = input.data;
+                r_fc_input_last = input.last;
+                r_fc_input_valid = input.valid;
+            }
+        }
+        if (output.ready) {
+            r_fc_output_valid = false;
+        }
+        // The held message beat leaves at this edge, or there is none. A
+        // pending commit then covers the whole frame and is done; until then
+        // it may commit the frame's earlier beats, which is harmless. A
+        // cancel lasts one cycle.
+        val message_free = !message.valid || message.ready;
+        if (message_free) {
+            message.valid = false;
+            message_commit = false;
+        }
+        message_cancel = false;
+        // process input data if possible; message and final beats need the
+        // message register, so frames never mix in the FIFO
+        val needs_message = r_num_words < c_message_cycles || r_fc_input_last;
+        if (r_fc_input_valid && !r_fc_output_valid && (message_free || !needs_message)) {
+            // clear syndromes if this is the first word
+            if (!r_processing) {
+                r_syndromes = [RS.sym_zero] * r_syndromes.len;
+            }
+            // Evaluate x**padding * C(x), retaining the same full-width
+            // Horner update on every beat. Known padding is ignored even
+            // if the source supplies nonzero values in those lanes.
+            var v_input_data = r_fc_input_data;
+            if (r_num_words == c_codeword_cycles - 1) {
+                v_input_data[0..c_codeword_padding] = [RS.sym_zero] * c_codeword_padding;
+            }
+            // evaluate sub-polynomial and update syndromes
+            for (j in 0..2 * RS.t) {
+                var v_reduce = RS.gf_extend(v_input_data[0]);
+                for (i in 0..unroll - 1) {
+                    v_reduce = v_reduce ^ RS.gf_mul_long(v_input_data[i + 1], c_table[i][j]);
+                }
+                v_reduce = v_reduce ^ RS.gf_mul_long(r_syndromes[j], c_table[unroll - 1][j]);
+                r_syndromes[j] = RS.gf_reduce(v_reduce);
+            }
+            // Forward message beats in stream order. The mixed beat's low
+            // parity/padding lanes are cleared by RsCorrection. A complete
+            // frame is committed; a malformed frame is cancelled, without
+            // forwarding its final beat.
+            val complete = r_fc_input_last && r_num_words == c_codeword_cycles - 1;
+            if (r_num_words < c_message_cycles && (!r_fc_input_last || complete)) {
+                message.data = v_input_data;
+                message.valid = true;
+            }
+            if (r_fc_input_last) {
+                message_commit = complete;
+                message_cancel = !complete;
+            }
+            // handle last codeword flag and update word counter
+            if (r_fc_input_last) {
+                r_fc_output_valid = complete;
+                r_num_words = 0;
+            } else if (r_num_words != c_codeword_cycles) {
+                r_num_words = r_num_words + 1;
+            }
+            // update processing flag
+            r_processing = !r_fc_input_last;
+            // clear input buffer
+            r_fc_input_valid = false;
+        }
+        // output data from updated register variables
+        if (!buffered) {
+            r_input_ready_cond = true;
+            r_input_ready_uncond = !r_fc_output_valid;
+        } else {
+            r_input_ready_cond = false;
+            r_input_ready_uncond = !r_fc_input_valid;
+        }
+        r_message_beat = r_num_words < c_message_cycles;
+        output.data = RsSyndromesBlock(RS=RS).new(
+            syndromes=r_syndromes,
+        );
+        output.valid = r_fc_output_valid;
+    }
+}
+
+fn generate_table(RS: type, unroll: positive) -> [unroll][2 * RS.t]RS.Sym {
+    var v_table: [unroll][2 * RS.t]RS.Sym = [[0] * (2 * RS.t)] * unroll;
+    for (i in 0..unroll) {
+        for (j in 0..2 * RS.t) {
+            v_table[i][j] = RS.lut_exp[((1 + i) * (RS.fcr + j)) % (RS.q - 1)];
+        }
+    }
+    return v_table;
+}

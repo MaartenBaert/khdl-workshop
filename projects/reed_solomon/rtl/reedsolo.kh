@@ -1,0 +1,132 @@
+// Reed–Solomon parameters and tables are evaluated by KHDL during elaboration.
+// This replaces the VHDL codegen's parameter and lookup-table sections.
+
+pub fn rs_config(
+    n: positive = 240, k: positive = 224, m: positive = 8,
+    prim: positive = 285, alpha: positive = 2, fcr: uint = 1,
+) -> type {
+    assert(n < 2**m, "RS n must be smaller than the field size");
+    assert(k < n, "RS k must be smaller than n");
+    assert((n - k) % 2 == 0, "RS requires an even number of parity symbols");
+    assert(fcr <= 1, "RS fcr must be 0 or 1");
+    assert(2**m <= prim && prim < 2**(m + 1), "RS prim must be a monic polynomial of degree m");
+    assert(alpha < 2**m, "RS alpha must be a nonzero field element");
+    // Construct eagerly so an invalid field/generator fails at configuration time.
+    const exponent_table = generate_exp(m, prim, alpha);
+    struct Config {
+        // primary parameters (the original VHDL codegen inputs)
+        const n = n;
+        const k = k;
+        const m = m;
+        const prim = prim;
+        const alpha = alpha;
+        const fcr = fcr;
+        // derived parameters
+        const t = (n - k) / 2;
+        const q = 2**m;
+        // types
+        type Sym = uint(m);
+        type SymLong = uint(2 * m - 1);
+        // convenience constants
+        const sym_zero = 0;
+        const sym_one = 1;
+        const sym_zero_long = 0;
+        const sym_one_long = 1;
+        // The three tables formerly emitted by codegen.py.
+        const lut_exp = exponent_table;
+        const lut_inv = generate_inverse(m, lut_exp);
+        // Reduction is in the polynomial basis, independently of alpha.
+        // The old VHDL used exponent-table entries here, implicitly assuming alpha=2.
+        const lut_reduce = [polynomial_reduce(m, prim, 2**i) for i in m..2 * m - 1];
+
+        fn gf_extend(a: Sym) -> SymLong { return a; }
+        fn gf_mul_long(a: Sym, b: Sym) -> SymLong {
+            return polynomial_product(m, a, b);
+        }
+        fn gf_reduce(a: SymLong) -> Sym {
+            // Fold each high polynomial coefficient into the low symbol bits.
+            val a_bits = SymLong.to_bits(a);
+            var accum = a_bits[0..m];
+            for (i in Sym.size_bits..SymLong.size_bits) {
+                const coefficient = Sym.to_bits(lut_reduce[i - m]);
+                accum = accum ^ (coefficient & a_bits[i]);
+            }
+            return Sym.from_bits(accum);
+        }
+        fn gf_mul(a: Sym, b: Sym) -> Sym {
+            return gf_reduce(gf_mul_long(a, b));
+        }
+        fn generate_generator() -> [2 * t]Sym {
+            // Multiply (x + alpha**(fcr+i)); coefficients are low-order first.
+            var coefficients: [2 * t + 1]Sym = [0] * (2 * t + 1);
+            coefficients[0] = 1;
+            for (i in 0..2 * t) {
+                val root = lut_exp[(fcr + i) % (q - 1)];
+                for (reverse in 0..i + 2) {
+                    val j = i + 1 - reverse;
+                    var previous: Sym = 0;
+                    if (j > 0) { previous = coefficients[j - 1]; }
+                    coefficients[j] = gf_mul(coefficients[j], root) ^ previous;
+                }
+            }
+            // The leading coefficient is one and is implicit in the encoder.
+            assert(coefficients[2 * t] == 1);
+            return coefficients[0..2 * t];
+        }
+        const generator = generate_generator();
+    }
+    return Config;
+}
+
+fn polynomial_product(m: positive, a: uint(m), b: uint(m)) -> uint(2 * m - 1) {
+    // Same shifted XOR partial products as rs_gf_mul_long in VHDL.
+    val a_bits = uint(m).to_bits(a);
+    val b_bits = uint(m).to_bits(b);
+    var accum: uint(2 * m - 1) = 0;
+    for (i in 0..uint(m).size_bits) {
+        val term = uint(m).from_bits(a_bits & b_bits[i]);
+        accum = accum ^ (term << i);
+    }
+    return accum;
+}
+
+fn polynomial_reduce(m: positive, prim: uint(m + 1), value: uint(2 * m - 1)) -> uint(m) {
+    // Polynomial long division used only to build constants; no lookup-table dependency.
+    var remainder = value;
+    for (reverse in 0..m - 1) {
+        val high = 2 * m - 2 - reverse;
+        if ((remainder & 2**high) != 0) {
+            remainder = remainder ^ (prim << (high - m));
+        }
+    }
+    return remainder & (2**m - 1);
+}
+
+fn generate_exp(m: positive, prim: uint(m + 1), alpha: uint(m)) -> [2**m]uint(m) {
+    const q = 2**m;
+    var table: [q]uint(m) = [0] * q;
+    var seen: [q]bool = [false] * q;
+    var value: uint(m) = 1;
+    for (i in 0..q - 1) {
+        assert(value != 0 && !seen[value], "RS prim/alpha must generate every nonzero field element");
+        table[i] = value;
+        seen[value] = true;
+        value = polynomial_reduce(m, prim, polynomial_product(m, value, alpha));
+    }
+    assert(value == 1, "RS alpha must have order 2**m - 1");
+    // table[q-1]=0 is the Python/VHDL convention, not a cyclic exponent entry.
+    return table;
+}
+
+fn generate_inverse(m: positive, exponent: [2**m]uint(m)) -> [2**m]uint(m) {
+    const q = 2**m;
+    var inverse: [q]uint(m) = [0] * q;
+    inverse[1] = 1;
+    for (i in 1..q - 1) {
+        inverse[exponent[i]] = exponent[q - 1 - i];
+    }
+    return inverse;
+}
+
+// Default configuration used only when no explicit RS generic is supplied.
+pub type RsDefault = rs_config();

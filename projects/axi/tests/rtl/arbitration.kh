@@ -1,0 +1,36 @@
+// Three endpoints exercise non-power-of-two round robin without response traffic.
+// Eight contexts each leave room for the bounded test's requests and prefetch.
+import axi.interfaces.Axi;
+import axi.types.[AxiDefault, read_request, write_request];
+import axi.manager.[manager, read_endpoint, write_endpoint];
+
+module ArbitrationProbe(C: type = AxiDefault) ports(
+    clk: in clock, rst: in async bool,
+    sync(clk, async rst) {
+        read_enable: in [3]bool, write_enable: in [3]bool,
+        bus: interface Axi(C).Manager,
+    }
+) {
+    clocked(clk, async rst) {
+        val reads = (read_endpoint(C, id=1, capacity=8),
+            read_endpoint(C, id=5, capacity=8), read_endpoint(C, id=9, capacity=8));
+        val writes = (write_endpoint(C, id=1, capacity=8),
+            write_endpoint(C, id=5, capacity=8), write_endpoint(C, id=9, capacity=8));
+        val api = manager(C, ref(bus), reads=reads, writes=writes);
+        api.begin();
+        var index = 0;
+        for (endpoint in reads) {
+            if (read_enable[index] && endpoint.can_push()) { endpoint.push(read_request(C, index * 16)); }
+            if (endpoint.can_pop()) { val _ = endpoint.pop(); }
+            index += 1;
+        }
+        index = 0;
+        for (endpoint in writes) {
+            if (write_enable[index] && endpoint.can_push()) { endpoint.push(write_request(C, index * 16)); }
+            if (endpoint.can_push_data()) { val _ = endpoint.push_data(index, 2**C.bytes - 1); }
+            if (endpoint.can_pop()) { val _ = endpoint.pop(); }
+            index += 1;
+        }
+        api.end();
+    }
+}

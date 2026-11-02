@@ -1,0 +1,187 @@
+[[reed-solomon-decoder]]
+== RsDecoder
+
+Source: `rtl/reedsolo_decoder.kh`.
+
+[[reed-solomon-decoder-interfaces]]
+=== Function and interfaces
+
+`RsDecoder` corrects received codewords and streams out their messages. It
+chains the five stages described in <<reed-solomon-primer-decoding>>, while the
+received message beats wait in a packet FIFO:
+
+....
+codeword stream
+  -> RsSyndromes ---------------------- message beats --> RsPacketFifo --+
+  -> RsBerlekamp (one or more workers)                                   |
+  -> RsChien                                                             |
+  -> RsForney (one or more workers)                                      |
+  -> RsCorrection <------------------------------------------------------+
+  -> message stream
+....
+
+Each stage owns one working frame, so several frames can be in flight in the
+pipeline. Stages pass whole frames to each other as single block transactions
+that carry only the decoding information; see <<reed-solomon-stages>>. Apart
+from the message buffer, the wrapper adds no arithmetic, clock boundaries, or
+buffers.
+
+`input` is `RsStream(U, decoded=false, RS=RS).Sink`, accepting `C=(n +/ U)` codeword beats
+per frame. `output` is `RsStream(U, decoded=true, RS=RS).Source`, producing
+`K=(k +/ U)` message beats per frame, each with the frame's `num_errors` and
+`failed` status. Both streams have the same width `U`. Ordering and padding
+follow <<reed-solomon-ordering>>. A frame whose `last` arrives on the wrong beat
+is discarded without output; see <<reed-solomon-limits>>.
+
+[cols="1,1,3",options="header"]
+|===
+|Parameter |Default |Effect / constraint
+|RS |RsDefault |Shared configuration for all stages and interfaces.
+|parallelism.stream_unroll |1 |Any positive `U`: both external streams, `RsSyndromes` input,
+`RsChien` search lanes, `RsForney` position layout, and `RsCorrection` output.
+|parallelism.berlekamp_unroll |1 |`U_B` iterations per BM cycle; divides `R`.
+|parallelism.omegas_unroll |1 |`U_O` evaluator iterations per cycle; divides `t`.
+|parallelism.forney_unroll |1 |`U_F` arithmetic steps per `RsForney` cycle; `U_F <= R`.
+|parallelism.berlekamp_instances |1 |Positive number `N_B` of parallel `RsBerlekamp` workers; each uses `parallelism.berlekamp_unroll`.
+|parallelism.forney_instances |1 |Positive number `N_F` of parallel `RsForney` workers; each uses `parallelism.forney_unroll`.
+|buffered |false |Passed only to `RsSyndromes`; optional one-beat input holding register (<<reed-solomon-flow-control>>).
+|message_buffer |`full_message_buffer(RS, parallelism)` |Depth, memory, and bypass of the message FIFO; see <<reed-solomon-decoder-message-buffer>>.
+|===
+
+With an `External` message buffer memory, the decoder has an extra
+`message_ram: RsRamPort([U]RS.Sym, depth).Controller` port for it.
+
+[[reed-solomon-decoder-parallelism]]
+=== Choosing parallelism
+
+`parallelism` is an elaboration-time `RsDecoderParallelism` value, defined in
+`reedsolo_decoder` alongside `RsDecoder`. Omitting it sets all six fields to
+one; constructing a value explicitly supplies every field. It offers two
+independent ways to speed up the decoder:
+
+* *Unrolling* performs more iterations of a stage's algorithm per clock cycle.
+  `stream_unroll` widens the streams and the stages that process them;
+  `berlekamp_unroll`, `omegas_unroll`, and `forney_unroll` chain more dependent
+  field operations into each cycle, which lengthens the combinational path.
+* *Replication* adds workers for the two serial arithmetic stages.
+  `berlekamp_instances` and `forney_instances` process different frames in
+  parallel, increasing throughput without lengthening any path. A count of one
+  connects the stage directly. Larger counts surround the workers with
+  `RsRoundRobinDispatch` and `RsRoundRobinCollect`, which hand out frames in
+  strict rotation and restore their order (<<reed-solomon-round-robin>>). Each
+  bank has its own count and rotation.
+
+For example, for RS(13,7), where `R=6` and `t=3`:
+
+----
+import reedsolo_decoder.[RsDecoder, RsDecoderParallelism];
+
+instance RsDecoder(
+    parallelism=RsDecoderParallelism.new(
+        stream_unroll=4, berlekamp_unroll=3, omegas_unroll=3, forney_unroll=4,
+        berlekamp_instances=2, forney_instances=2,
+    ),
+    buffered=false,
+    RS=RS,
+) ports(clk, rst, input, output);
+----
+
+The wrapper passes each field to the corresponding stage parameter. `RS` still
+selects the code, and `buffered` separately selects input flow control. The
+Python export tool sets the same values with its `--unroll`, `--unroll-*`, and
+`--*-instances` flags. <<reed-solomon-performance>> can select the cheapest
+`parallelism` for a latency and throughput target.
+
+[[reed-solomon-decoder-message-buffer]]
+=== Sizing the message buffer
+
+`message_buffer` is an `RsMessageBuffer` value with fields `depth` (in stream
+beats), `memory` (an `RsFifoMemory`), and `bypass`, which configure the
+`RsPacketFifo` of <<reed-solomon-packet-fifo>>. The depth must hold at least one
+message frame of `K` beats; smaller values fail elaboration.
+
+The default, `full_message_buffer(RS, parallelism)`, has room for every frame
+the pipeline can hold at once: one each in `RsSyndromes`, `RsChien`, and
+`RsCorrection`, plus one per Berlekamp and Forney worker, so
+`depth = (3 + N_B + N_F) * K`. It uses `Lut` memory with bypass. Such a buffer
+never limits the decoder, and the timing below applies unchanged.
+
+A smaller buffer is always correct: when it is full, `RsSyndromes` waits, and
+`RsCorrection` always drains the oldest frame once its block arrives. It only
+lowers throughput when more frames are in flight than it can hold, which
+depends on the target interval rather than on the pipeline's capacity.
+`select_message_buffer` computes the size for a target interval
+(<<reed-solomon-message-buffer-selection>>), and the export tool's
+`--message-interval` flag uses it. A non-bypass buffer, or a large read
+latency, can also delay `RsCorrection` when the block stages are faster than
+the message path, for example with very few stage cycles.
+
+[[reed-solomon-decoder-timing]]
+=== Latency and throughput
+
+For a correctly framed frame entering an empty pipeline, with continuously
+available input and an always-ready consumer, define:
+
+----
+C = (n +/ U)                            codeword beats, RsSyndromes cycles
+K = (k +/ U)                            message beats, RsCorrection cycles
+B = R / U_B                             RsBerlekamp cycles
+H = max(t / U_O, C)                     RsChien cycles
+F = (((t +/ 2) - fcr + t + 2) +/ U_F)   RsForney cycles
+----
+
+The first output beat transfers `C+B+H+F+1` cycles after the first input beat,
+and the last output beat `C+B+H+F+K` cycles after it. Each stage starts
+computing at the edge that accepts its block; the `+1` is the registered
+first output beat of `RsCorrection`. These counts are from transfer to
+transfer. Backpressure, input gaps, or older frames still occupying stages can
+increase latency. `buffered` adds no fixed cycle.
+
+For RS(13,7) with `U=4`, `U_B=3`, `U_O=3`, `U_F=4`, and `fcr=0`, the stage
+counts are `C=4`, `K=2`, `B=2`, `H=4`, and `F=2`. Input beats transfer at
+edges 0 through 3, and message beats at edges 13 and 14:
+
+.Internal transfer rows name the edges at which each block crosses a stage boundary.
+[wavedrom]
+....
+{"signal":[
+  {"name":"clk","wave":"p..............."},
+  {"name":"input transfer","wave":"1...0..........."},
+  {"name":"input.last","wave":"0..10..........."},
+  {"name":"RsSyndromes -> RsBerlekamp","wave":"0...10.........."},
+  {"name":"RsBerlekamp -> RsChien","wave":"0.....10........"},
+  {"name":"RsChien -> RsForney","wave":"0.........10...."},
+  {"name":"RsForney -> RsCorrection","wave":"0...........10.."},
+  {"name":"output.valid","wave":"0............1.0"},
+  {"name":"output.ready","wave":"1..............."},
+  {"name":"output.data","wave":"x............23x","data":["d3..d6","0,d0..d2"]},
+  {"name":"output.last","wave":"0.............10"}
+],"head":{"text":"RsDecoder: RS(13,7), U=4, U_B=3, U_O=3, U_F=4","tick":0},"config":{"hscale":2}}
+....
+
+With continuous traffic, the slowest stage sets the sustained rate of
+`max(B/N_B, H, F/N_F)` cycles per frame. `H>=C>=K` already covers the input and
+output stream bandwidth, and `H>=1` covers the routers' limit of one block per
+cycle. A finished block can transfer, and its stage accept the next block, at
+the same edge. Replication divides the `B` and `F` service times but not their
+latency. When the bottleneck is a fractional `B/N_B` or `F/N_F`, the gaps
+between output frames vary, and the rate is a long-run average. Frames always leave in their arrival
+order; there is no reordering or frame identifier.
+
+Two worked examples for RS(13,7) with `U=4` and `fcr=0`:
+
+* With `U_B=1`, `U_O=3`, and `U_F=4`: `C=H=4`, `B=6`, and `F=K=2`, so one
+  Berlekamp worker limits the decoder to one frame every six cycles. Two
+  workers reach the four-cycle limit of `RsChien`, and a third adds nothing.
+  The first output stays at cycle 17 in all three cases.
+* With `U_B=3` and `U_F=1`: `B=2` and `F=7`, so one Forney worker limits the
+  rate to one frame every seven cycles, and two workers reach four cycles. The
+  first output is at cycle 18. With `U_B=U_F=1`, two workers in each bank
+  also reach four cycles per frame, with the first output at cycle 22.
+
+See <<reed-solomon-performance>> for the formulas of each stage, the timing
+model functions, and automatic parallelism selection.
+
+The wrapper enforces matching stream, search, and output widths and a common
+`RS` type. Users of individual stages must preserve those agreements
+themselves (<<reed-solomon-positions>>).

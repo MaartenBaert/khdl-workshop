@@ -1,0 +1,323 @@
+// Packet FIFO with commit/cancel, a port of axi_fifo_packet_{lut,ram,exram}.
+// One module covers every memory flavor: the FIFO algorithm is written once
+// against a small memory API (a write and a fixed-latency read per cycle), and
+// the `memory` generic selects the implementation behind it.
+import reedsolo_interfaces.[RsTransaction];
+
+// Where the FIFO stores its entries, and how long a read takes.
+pub enum RsFifoMemory {
+    // Internal memory with combinational read, like distributed (LUT) RAM.
+    Lut,
+    // Internal memory with registered read and the given total read latency:
+    // one for plain block RAM, more with output registers.
+    Block(positive),
+    // External RAM behind an RsRamPort, with the given total read latency:
+    // cycles from the FIFO's read decision to the data on `read_data`. The
+    // FIFO registers its requests, so this is one more than the RAM's own
+    // latency from request to data on its port.
+    External(positive),
+}
+
+// One write and one read port. The RAM must apply requests in order with the
+// same latency for writes and reads, so that a read observes earlier writes.
+pub interface RsRamPort(T: type, depth: positive) {
+    write_enable: bool,
+    write_address: uint(0..depth),
+    write_data: T,
+    read_enable: bool,
+    read_address: uint(0..depth),
+    read_data: T,
+    view Controller {
+        write_enable: out, write_address: out, write_data: out,
+        read_enable: out, read_address: out, read_data: in,
+    }
+    view Memory {
+        write_enable: in, write_address: in, write_data: in,
+        read_enable: in, read_address: in, read_data: out,
+    }
+}
+
+// Memory API used by the FIFO. Call write and read exactly once per cycle.
+// read() returns the data requested `latency` cycles earlier; with zero
+// latency, it returns the data of the current request.
+struct ArrayMemory(T: type, depth: positive, read_latency: uint) {
+    const latency = read_latency;
+    ref memory: [depth]T,
+    ref pipeline: [read_latency]T,
+
+    fn write(self, enable: bool, address: uint(0..depth), data: T) {
+        if (enable) { self.memory[address] = data; }
+    }
+    fn read(self, enable: bool, address: uint(0..depth)) -> T {
+        var data = self.memory[address];
+        if (read_latency > 0) {
+            val response = self.pipeline[read_latency - 1];
+            self.pipeline = [data, *self.pipeline[0..read_latency - 1]];
+            data = response;
+        }
+        return data;
+    }
+}
+
+fn array_memory(T: type, depth: positive, latency: uint) -> ArrayMemory(T, depth, latency) {
+    reg r_memory: [depth]T = undef;
+    reg r_pipeline: [latency]T = undef;
+    return ArrayMemory(T, depth, latency).new(memory=ref(r_memory), pipeline=ref(r_pipeline));
+}
+
+struct ExternalMemory(T: type, depth: positive, read_latency: positive) {
+    const latency = read_latency;
+    ref ram: RsRamPort(T, depth),
+
+    fn write(self, enable: bool, address: uint(0..depth), data: T) {
+        self.ram.write_enable = enable;
+        self.ram.write_address = address;
+        self.ram.write_data = data;
+    }
+    fn read(self, enable: bool, address: uint(0..depth)) -> T {
+        val response = self.ram.read_data;
+        self.ram.read_enable = enable;
+        self.ram.read_address = address;
+        return response;
+    }
+}
+
+fn external_memory(T: type, depth: positive, latency: positive,
+    ram: RefInterface(RsRamPort(T, depth))) -> ExternalMemory(T, depth, latency) {
+    val api = ExternalMemory(T, depth, latency).new(ram=ram);
+    reg wire api.ram.write_enable = false;
+    reg wire api.ram.write_address = 0;
+    reg wire api.ram.write_data = undef;
+    reg wire api.ram.read_enable = false;
+    reg wire api.ram.read_address = 0;
+    return api;
+}
+
+// The memory API type for a flavor, used for its latency before binding.
+fn memory_type(T: type, depth: positive, memory: RsFifoMemory) -> type {
+    match (memory) {
+        .Lut => { return ArrayMemory(T, depth, 0); }
+        .Block(val latency) => { return ArrayMemory(T, depth, latency); }
+        .External(val latency) => { return ExternalMemory(T, depth, latency); }
+    }
+}
+
+// Ring-buffer index arithmetic without runtime modulo.
+fn advance(size: positive, index: uint(0..size)) -> uint(0..size) {
+    if (index == size - 1) { return 0; } else { return index + 1; }
+}
+
+fn offset(size: positive, index: uint(0..size), amount: uint) -> uint(0..size) {
+    var result = index + amount % size;
+    if (result >= size) { result = result - size; }
+    return result;
+}
+
+// A ready/valid FIFO whose entries become visible only when committed. Cancel,
+// push, and commit are applied in that order within a cycle, independently of
+// each other: tie cancel to a first-beat flag and commit to the last-beat flag.
+// A packet longer than `depth` can never be committed.
+//
+// With `bypass`, the FIFO is cycle-equivalent to a LUT FIFO for every memory:
+// committed data is visible in the next cycle. Without it, entries reach the
+// output only through memory reads, adding latency but less logic.
+pub module RsPacketFifo(
+    T: type,
+    depth: positive,
+    memory: RsFifoMemory = RsFifoMemory.Lut,
+    bypass: bool = true,
+) ports(
+    clk: in clock,
+    sync(clk) {
+        rst: in bool,
+        input: interface RsTransaction(T).Sink,
+        cancel: in bool,
+        commit: in bool,
+        output: interface RsTransaction(T).Source,
+        match (memory) {
+            .External(_) => { ram: interface RsRamPort(T, depth).Controller }
+            _ => {}
+        }
+    }
+) {
+    // The output queue holds the head entries. It is one entry longer than the
+    // read latency, so reads issued at each pop arrive before they are needed.
+    const c_latency = memory_type(T, depth, memory).latency;
+    const c_queue = c_latency + 1;
+    wire queue: sync(clk) [c_queue]T;
+    wire queue_read: sync(clk) uint(0..c_queue);
+    comb {
+        output.data = queue[queue_read];
+    }
+    clocked(clk, sync rst) {
+        reg wire input.ready = true;
+        reg wire output.valid = false;
+        reg wire queue = undef;
+        reg wire queue_read = 0;
+        var api;
+        match (memory) {
+            .Lut => { api = array_memory(T, depth, 0); }
+            .Block(val latency) => { api = array_memory(T, depth, latency); }
+            .External(val latency) => { api = external_memory(T, depth, latency, ref(ram)); }
+        }
+
+        // Positions in memory, and the number of written and committed entries
+        // that it still holds. Every committed entry is also written.
+        reg r_read_pos: uint(0..depth) = 0;
+        reg r_write_pos: uint(0..depth) = 0;
+        reg r_commit_pos: uint(0..depth) = 0;
+        reg r_written: uint(0..=depth) = 0;
+        reg r_committed: uint(0..=depth) = 0;
+        val push = input.valid && input.ready;
+
+        if (bypass) {
+            // The queue holds the first c_queue entries, committed or not. An
+            // entry written within that window goes to the queue directly;
+            // later entries are fetched when a pop moves them into the window.
+            // Each fetch's delay-line flags record whether its entry existed
+            // when fetched, relative to the written and the committed entries,
+            // so cancel and commit can retarget fetches still in flight.
+            reg r_queue_write: uint(0..c_queue) = 0;
+            reg r_queue_commit: uint(0..c_queue) = 0;
+            reg r_queue_fetch: uint(0..c_queue) = 0;
+            reg r_fetch_enable: [c_latency]bool = [false] * c_latency;
+            reg r_fetch_written: [c_latency]bool = [false] * c_latency;
+            reg r_fetch_committed: [c_latency]bool = [false] * c_latency;
+            val pop = output.ready && r_committed > 0;
+            val written_beyond = r_written > c_queue;
+            val committed_beyond = r_committed > c_queue;
+            val fetch_enable = [pop, *r_fetch_enable];
+            var fetch_written = [written_beyond, *r_fetch_written];
+            var fetch_committed = [committed_beyond, *r_fetch_committed];
+            val response = api.read(pop, offset(depth, r_read_pos, c_queue));
+
+            if (pop && r_committed > 0) {
+                r_read_pos = advance(depth, r_read_pos);
+                queue_read = advance(c_queue, queue_read);
+                assert_assume(r_written > 0, "Every committed entry is also written");
+                r_written = r_written - 1;
+                r_committed = r_committed - 1;
+            }
+            if (cancel) {
+                r_write_pos = r_commit_pos;
+                r_written = r_committed;
+                r_queue_write = r_queue_commit;
+                fetch_written = fetch_committed;
+            }
+            api.write(push, r_write_pos, input.data);
+            if (push) {
+                if (r_written < c_queue) { queue[r_queue_write] = input.data; }
+                r_queue_write = advance(c_queue, r_queue_write);
+                r_write_pos = advance(depth, r_write_pos);
+                assert_assume(r_written < depth, "Pop and cancel only reduce the count since input.ready");
+                r_written = r_written + 1;
+            }
+            if (commit) {
+                r_commit_pos = r_write_pos;
+                r_committed = r_written;
+                r_queue_commit = r_queue_write;
+                fetch_committed = fetch_written;
+            }
+            if (fetch_enable[c_latency]) {
+                if (fetch_written[c_latency]) { queue[r_queue_fetch] = response; }
+                r_queue_fetch = advance(c_queue, r_queue_fetch);
+            }
+            r_fetch_enable = fetch_enable[0..c_latency];
+            r_fetch_written = fetch_written[0..c_latency];
+            r_fetch_committed = fetch_committed[0..c_latency];
+            output.valid = r_committed > 0;
+        } else {
+            // The queue receives committed entries only, by fetches issued
+            // whenever it has room for them, counting fetches in flight. A
+            // fetch releases the entry's memory slot.
+            reg r_queue_write: uint(0..c_queue) = 0;
+            reg r_queue_count: uint(0..=c_queue) = 0;
+            reg r_fetch_enable: [c_latency]bool = [false] * c_latency;
+            var in_flight = 0;
+            for (issued in r_fetch_enable) { if (issued) { in_flight += 1; } }
+            val pop = output.ready && r_queue_count > 0;
+            val fetch = r_committed > 0 && (pop || r_queue_count + in_flight < c_queue);
+            val fetch_enable = [fetch, *r_fetch_enable];
+            val response = api.read(fetch, r_read_pos);
+
+            if (pop && r_queue_count > 0) {
+                queue_read = advance(c_queue, queue_read);
+                r_queue_count = r_queue_count - 1;
+            }
+            if (fetch && r_committed > 0) {
+                r_read_pos = advance(depth, r_read_pos);
+                assert_assume(r_written > 0, "Every committed entry is also written");
+                r_written = r_written - 1;
+                r_committed = r_committed - 1;
+            }
+            if (cancel) {
+                r_write_pos = r_commit_pos;
+                r_written = r_committed;
+            }
+            api.write(push, r_write_pos, input.data);
+            if (push) {
+                r_write_pos = advance(depth, r_write_pos);
+                assert_assume(r_written < depth, "Fetch and cancel only reduce the count since input.ready");
+                r_written = r_written + 1;
+            }
+            if (commit) {
+                r_commit_pos = r_write_pos;
+                r_committed = r_written;
+            }
+            if (fetch_enable[c_latency]) {
+                queue[r_queue_write] = response;
+                r_queue_write = advance(c_queue, r_queue_write);
+                assert_assume(r_queue_count < c_queue, "Fetches are only issued with room in the queue");
+                r_queue_count = r_queue_count + 1;
+            }
+            r_fetch_enable = fetch_enable[0..c_latency];
+            output.valid = r_queue_count > 0;
+        }
+        input.ready = r_written < depth;
+    }
+}
+
+// Behavioral one-write, one-read RAM for simulating an external memory, like
+// ram_wrapper. Requests pass through `input_latency` registers, the memory
+// read is registered, and read data passes through `output_latency` more, for
+// a latency of input_latency + 1 + output_latency from request to data. Behind
+// a packet FIFO's registered requests, use External(input_latency +
+// output_latency + 2). A read and a write of the same address in the same
+// cycle return the old data.
+pub module RsRam(T: type, depth: positive, input_latency: uint = 0, output_latency: uint = 0) ports(
+    clk: in clock,
+    sync(clk) {
+        rst: in bool,
+        ram: interface RsRamPort(T, depth).Memory,
+    }
+) {
+    clocked(clk, sync rst) {
+        reg wire ram.read_data = undef;
+        reg r_memory: [depth]T = undef;
+        // Request delay lines; only the enables need defined reset values.
+        reg r_write_enable: [input_latency]bool = [false] * input_latency;
+        reg r_write_address: [input_latency]uint(0..depth) = undef;
+        reg r_write_data: [input_latency]T = undef;
+        reg r_read_enable: [input_latency]bool = [false] * input_latency;
+        reg r_read_address: [input_latency]uint(0..depth) = undef;
+        reg r_read_data: [output_latency]T = undef;
+        reg r_read_value: T = undef;
+
+        val write_enable = [ram.write_enable, *r_write_enable];
+        val write_address = [ram.write_address, *r_write_address];
+        val write_data = [ram.write_data, *r_write_data];
+        val read_enable = [ram.read_enable, *r_read_enable];
+        val read_address = [ram.read_address, *r_read_address];
+        r_write_enable = write_enable[0..input_latency];
+        r_write_address = write_address[0..input_latency];
+        r_write_data = write_data[0..input_latency];
+        r_read_enable = read_enable[0..input_latency];
+        r_read_address = read_address[0..input_latency];
+
+        if (read_enable[input_latency]) { r_read_value = r_memory[read_address[input_latency]]; }
+        if (write_enable[input_latency]) { r_memory[write_address[input_latency]] = write_data[input_latency]; }
+        val read_data = [r_read_value, *r_read_data];
+        r_read_data = read_data[0..output_latency];
+        ram.read_data = read_data[output_latency];
+    }
+}

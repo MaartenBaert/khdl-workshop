@@ -1,0 +1,184 @@
+[[axi4-subordinate]]
+== Serving transactions: the Subordinate API
+
+Source: `rtl/axi/subordinate.kh`.
+
+A Subordinate cannot choose the IDs of the requests it receives. It may hold
+several requests at once and, when their IDs differ, answer them in a
+different order than they arrived. The Subordinate API therefore identifies
+each accepted request with a local *token* rather than with its AXI ID.
+
+`subordinate(C, ref(bus), capacity=2)` binds an `Axi(C).Subordinate` port and
+returns an object with a `read` and a `write` side. Each side tracks up to
+`capacity` outstanding transactions. The API computes every beat's address and
+byte lanes, generates RID, BID, and RLAST, enforces same-ID response order, and
+checks that the Manager's requests and write data follow the AXI4 rules. The
+application decides only _when_ to serve each beat and _what_ data or response
+to return.
+
+[[axi4-tokens]]
+=== Tokens
+
+Popping a request from `api.read` or `api.write` reserves a context and returns
+the request with a token. A token is a small integer of type
+`uint(0..capacity)` that names the context. It is separate from the AXI ID:
+two live requests can share an ID, but never a token. All further calls for
+that transaction take the token as an argument.
+
+[options="header",cols="2,3"]
+|===
+|Token owner |Lifetime ends
+|Subordinate read |When the final `respond(...)` is enqueued.
+|Subordinate write |When `complete(...)` is enqueued.
+|Pooled Manager read |When the final `ReadResult` is popped.
+|Pooled Manager write |When `WriteResult` is popped.
+|===
+
+Tokens are opaque by convention and have no generation counter. A stale token
+can therefore become valid again for a different transaction when its context
+is reused, and availability checks cannot detect this. Read and write tokens
+are separate. Never use a token after its lifetime ends or after reset. The
+fixed-ID Manager (<<axi4-manager>>) avoids this class of misuse by exposing no
+tokens; the pooled Manager (<<axi4-pooled-manager>>) uses tokens in the same way
+as the Subordinate.
+
+[[axi4-subordinate-reads]]
+=== Serving reads
+
+A typical Subordinate keeps the requests it has accepted in a local queue and
+serves the oldest one beat by beat. This read-only fragment returns data from
+a function `lookup`. It imports `subordinate` and `ReadRequest` from
+`axi.subordinate`, and `storage` from `channel.buffers`:
+
+----
+val api = subordinate(C, ref(bus), capacity=2);
+val reads = storage(ReadRequest(C, 2), 2);
+api.begin(); reads.begin();
+if (api.read.can_pop() && reads.can_push()) { reads.push(api.read.pop()); }
+if (reads.can_pop()) {
+    val request = reads.peek();
+    if (api.read.can_respond(request.token)) {
+        val address = api.read.address(request.token);
+        if (api.read.respond(request.token, lookup(C, address))) { val _ = reads.pop(); }
+    }
+}
+reads.end(); api.end();
+----
+
+`api.read.pop()` returns a `ReadRequest(C, capacity)` with fields `token` and
+`address`, the complete AR payload. `can_respond(token)` is true when this
+context is the oldest live context for its ID and the R output slot is free.
+`address(token)` and `strobes(token)` give the byte address and the permitted
+lane mask of the context's next beat. `respond(token, data, resp=0, user=0)`
+sends that beat with the correct RID and RLAST, and returns true for the final
+beat. Here the local queue entry is popped once the burst is finished. The
+`storage` helper selects an `Internal` slot for depth one and a `Fifo`
+otherwise (see <<axi-channel-reference>>).
+
+[[axi4-subordinate-writes]]
+=== Serving writes
+
+Writes follow the same pattern, with separate steps for data and completion:
+
+----
+if (api.write.can_pop() && writes.can_push()) { writes.push(api.write.pop()); }
+if (writes.can_pop()) {
+    val request = writes.peek();
+    if (api.write.can_pop_data(request.token)) {
+        val beat = api.write.pop_data(request.token);
+        // Store beat.data at beat.addr, honoring beat.strb.
+    }
+    if (api.write.can_complete(request.token)) {
+        api.write.complete(request.token);
+        val _ = writes.pop();
+    }
+}
+----
+
+`can_pop_data(token)` is true when the next W beat on the bus belongs to this
+context, because W follows AW order, and a beat is available.
+`pop_data(token)` returns a `WriteBeat(C)` with the beat's byte address `addr`,
+`data`, `strb`, a computed `last`, and `user`. It checks the Manager's WLAST
+and strobes. `can_complete(token)` is true once all of the context's W beats have
+been consumed, every older context with the same ID has completed, and the B
+output slot is free. `complete(token, resp=0, user=0)` then sends B with the
+correct BID.
+
+The AW and W receivers operate independently. A W beat that arrives before
+its AW request waits in the W receive slot and holds back further W beats until
+its request is popped. B cannot be sent until the application has popped the
+AW request and consumed the final W beat, so both have transferred at the
+Subordinate boundary. A Subordinate that serves data and completions from one
+queue, as above, stops accepting W data while a completion is stalled.
+`AxiRam` (<<axi4-ram>>) keeps a separate completion queue so that later write
+data can progress while an earlier B response waits.
+
+[[axi4-subordinate-operations]]
+=== Operation reference
+
+[options="header",cols="1,2,3"]
+|===
+|Side |Operation |Contract
+|Both |`can_pop()`, `peek()`, `pop()` |Reserve and consume an address request. The result contains `token` and `address`.
+|Read |`can_respond(token)` |This context owns its ID's next response and the R slot is available.
+|Read |`address(token)`, `strobes(token)` |Current beat's byte address and permitted lane mask, for a live context.
+|Read |`respond(token, data, resp=0, user=0) -> bool` |Queue R with computed RID/RLAST. Return whether it is final.
+|Write |`can_pop_data(token)` |This context owns the next W beat and data is available.
+|Write |`pop_data(token)` |Consume W. Return `addr`, `data`, `strb`, computed `last`, and `user`.
+|Write |`can_complete(token)` |All W beats consumed, same-ID predecessors complete, and B slot available.
+|Write |`complete(token, resp=0, user=0)` |Queue B with computed BID. Requires `can_complete(token)`.
+|===
+
+`subordinate` owns `begin()` and `end()` for both sides and all five channels.
+
+[[axi4-subordinate-ordering]]
+=== Ordering and context reclamation
+
+Same-ID responses remain ordered; different IDs can be served in any order by
+choosing which token to serve. R beats of different IDs may interleave.
+
+Request `peek()` exposes the token that the request would receive, but
+ownership starts only at `pop()`. The channel receiver can accept a request
+from the bus before the application reserves a context for it. One request
+beyond `capacity` can therefore transfer and wait in the receive slot before
+AR or AW is backpressured.
+
+Contexts are reclaimed in allocation order, although different-ID responses
+can be generated out of order. A finished context therefore stays allocated
+until every older context has finished too. A completed context may be
+reclaimed while its response is still stalled in the output slot, because that
+slot owns and preserves the payload.
+
+`AxiRam` uses the same request-queue algorithm with either `Internal` or `Fifo`
+storage. Changing the queue implementation can change latency without changing
+correctness.
+
+[[axi4-write-timing]]
+=== Example: write data before the address
+
+AXI allows a write's data to arrive before its address. This legal single-beat
+exchange shows W transferring before AW. The Subordinate keeps the early data
+and delays B until both AW and the final W have transferred. The diagram
+illustrates protocol dependencies, not a fixed response latency for any
+module. Each column is sampled at a rising edge, and updates caused by that
+edge appear in the next column.
+
+[wavedrom]
+....
+{
+  "signal": [
+    {"name":"clk", "wave":"p......."},
+    {"name":"aresetn", "wave":"01......"},
+    {"name":"AWVALID", "wave":"0...10.."},
+    {"name":"AWREADY", "wave":"1....0.1"},
+    {"name":"AWADDR", "wave":"x...=x..", "data":["A"]},
+    {"name":"WVALID", "wave":"0.10...."},
+    {"name":"WREADY", "wave":"1......."},
+    {"name":"WDATA", "wave":"x.=x....", "data":["D"]},
+    {"name":"WLAST", "wave":"0.10...."},
+    {"name":"BVALID", "wave":"0....1.0"},
+    {"name":"BREADY", "wave":"0.....1."},
+    {"name":"BRESP", "wave":"x....=.x", "data":["OKAY"]}
+  ]
+}
+....

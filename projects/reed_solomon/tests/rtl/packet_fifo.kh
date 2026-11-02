@@ -1,0 +1,36 @@
+// Verification-only tops and payload types for the packet FIFO benches,
+// injected by tests/test_packet_fifo.py.
+import reedsolo_interfaces.[RsTransaction];
+import reedsolo_packet_fifo.[RsPacketFifo, RsFifoMemory, RsRamPort, RsRam];
+
+pub type Word = uint(32);
+
+// A structured payload checks that the FIFO is generic over its data type.
+pub struct Beat {
+    symbols: [3]uint(4),
+    last: bool,
+}
+
+// An external-RAM packet FIFO connected to the behavioral RAM model.
+pub module PacketFifoWithRam(
+    T: type, depth: positive, input_latency: uint, output_latency: uint, bypass: bool,
+) ports(
+    clk: in clock,
+    sync(clk) {
+        rst: in bool,
+        input: interface RsTransaction(T).Sink,
+        cancel: in bool,
+        commit: in bool,
+        output: interface RsTransaction(T).Source,
+    }
+) {
+    wire ram: interface RsRamPort(T, depth);
+    instance RsPacketFifo(
+        T=T,
+        depth=depth,
+        memory=RsFifoMemory.External(input_latency + output_latency + 2),
+        bypass=bypass,
+    ) ports(clk, rst, input, cancel, commit, output, ram);
+    instance RsRam(T=T, depth=depth, input_latency=input_latency, output_latency=output_latency)
+        ports(clk, rst, ram);
+}

@@ -1,0 +1,100 @@
+[[reed-solomon-packet-fifo]]
+=== RsPacketFifo and RsRam
+
+Source: `rtl/reedsolo_packet_fifo.kh`.
+
+`RsPacketFifo` is a first-word-fall-through FIFO whose entries become visible
+only once committed, so a partially received packet can be cancelled. It is a
+KHDL port of the `axi_fifo_packet_lut`, `axi_fifo_packet_ram`, and
+`axi_fifo_packet_exram` designs, combined into one generic module. `RsDecoder`
+uses it to carry message beats past the block stages
+(<<reed-solomon-message-path>>).
+
+==== Function and interfaces
+
+`input` is `RsTransaction(T).Sink` and `output` is `RsTransaction(T).Source`,
+with the usual ready/valid rules (<<reed-solomon-interfaces>>). Two more inputs
+control packets, independently of `input.valid` and `input.ready`:
+
+* `cancel` discards every entry written since the last commit.
+* `commit` makes every entry written so far visible at the output.
+
+Within a cycle, the FIFO applies cancel, then the push, then commit. A packet
+can therefore be cancelled, the first beat of the next packet pushed, and that
+beat committed, all in one cycle. Tie `cancel` to a first-beat flag and
+`commit` to the last-beat flag. Packets must not exceed `depth` entries: a
+longer packet can never be committed, and the FIFO stops accepting input.
+
+[cols="1,1,3",options="header"]
+|===
+|Parameter |Default |Effect / constraint
+|T |— |Payload type, any hardware type.
+|depth |— |Positive number of memory entries; need not be a power of two.
+|memory |RsFifoMemory.Lut |Memory flavor and read latency; see below.
+|bypass |true |Keep the FIFO cycle-equivalent to a LUT FIFO for every memory.
+|===
+
+==== Memory flavors
+
+`memory` selects where the entries are stored. All flavors share one algorithm,
+written against a memory with a fixed read latency `L`:
+
+[cols="2,1,3",options="header"]
+|===
+|`RsFifoMemory` |`L` |Memory
+|`Lut` |0 |Internal, combinational read, like distributed (LUT) RAM.
+|`Block(l)` |`l` |Internal, registered read with total latency `l`: 1 for plain block RAM, more with output registers.
+|`External(l)` |`l` |External RAM on an extra `ram: RsRamPort(T, depth).Controller` port, with read data back `l` cycles after the FIFO decides to read.
+|===
+
+The FIFO registers its external RAM requests, so `l` is one more than the
+RAM's own latency from a request on its port to the read data. The external
+RAM must have one write and one read port, and
+must apply requests in order with equal write and read latency, so that a read
+observes all earlier writes. The FIFO never reads an address in the same cycle
+that it writes it.
+
+`RsRam(T, depth, input_latency=0, output_latency=0)` is a behavioral model of
+such a RAM, like `ram_wrapper`: requests pass through `input_latency` registers,
+the memory read is registered, and read data passes through `output_latency`
+more registers, for a latency of `input_latency + 1 + output_latency` on its
+port. Connect it as `External(input_latency + output_latency + 2)`.
+
+KHDL currently stores every array in flip-flops, so no flavor maps to RAM
+macros yet (https://github.com/khdl-lang/khdl/issues/47[khdl#47]). The flavors still define the timing that a real
+memory will need.
+
+==== Bypass and timing
+
+With `bypass=true`, the first `L+1` entries live in a small output queue. An
+entry written while it is within that window goes there directly; later entries
+are fetched from memory as pops move them into the window, and arrive just in
+time because the window is one entry longer than the read latency. The FIFO
+then behaves exactly like a LUT FIFO, whatever the memory: committed data is
+visible in the next cycle, `input.ready` is low exactly when `depth` entries
+are written, and it sustains one transfer per cycle on each side.
+
+With `bypass=false`, entries reach the output only through memory reads: the
+FIFO fetches committed entries into its `L+1`-entry output queue whenever the
+queue has room, counting reads in flight, and frees each entry's memory slot
+when it is fetched. Cancel no longer interacts with the read side, which saves
+the queue's direct write path and the fetch bookkeeping. Committed data becomes
+visible `L+2` cycles after its commit instead of one, and the FIFO can hold up
+to `depth+L+1` entries. Throughput is still one transfer per cycle once the
+queue is primed. In a long pipeline, where data waits in the FIFO anyway, this
+latency is usually hidden.
+
+.A single entry pushed and committed at edge zero, into an empty LUT FIFO.
+[wavedrom]
+....
+{"signal":[
+  {"name":"clk","wave":"p...."},
+  {"name":"input.valid","wave":"10..."},
+  {"name":"commit","wave":"10..."},
+  {"name":"output.valid (bypass)","wave":"01..."},
+  {"name":"output.valid (no bypass)","wave":"0.1.."}
+],"head":{"text":"RsPacketFifo: commit-to-output latency, L=0","tick":0},"config":{"hscale":2}}
+....
+
+Both settings deliver the same transactions in the same order; only their
+timing and capacity differ.

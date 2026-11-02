@@ -1,0 +1,167 @@
+// Local FIFO-style storage with the same operations as the channel endpoints,
+// so transaction algorithms work with either. Binding functions create the
+// persistent state in the caller's clocked process; begin/end delimit each
+// cycle's work. See endpoints.kh for the khdl#38 scratch-register TODOs.
+
+// Fifo is limited to one push and one pop per cycle. Availability is
+// sampled in begin, then each side consumes only its own opportunity. Neither
+// push->pop nor pop->push visibility is promised within a cycle. This separates
+// adjacent queues' data and availability paths even in a forwarding loop.
+pub struct Fifo(T: type, depth: int(2..) = 2) {
+    ref slots: [depth]T,
+    // TODO(khdl#38): ordinary per-cycle head snapshot, set by begin().
+    ref head: T,
+    ref read_index: uint(0..depth),
+    ref write_index: uint(0..depth),
+    ref level: uint(0..=depth),
+    // TODO(khdl#38): ordinary per-cycle availability/lifecycle fields.
+    ref push_available: bool,
+    ref pop_available: bool,
+    ref active: bool,
+
+    fn begin(self) {
+        assert(!self.active, "Fifo.begin(): previous cycle not ended");
+        self.active = true;
+        // Snapshot data as well as availability before application code runs.
+        // Reading the mutable slots after a push would otherwise build a
+        // write-through mux and a false data path through a forwarding loop.
+        self.head = self.slots[self.read_index];
+        self.push_available = self.level < depth;
+        self.pop_available = self.level > 0;
+    }
+    fn can_push(self) -> bool {
+        assert(self.active, "Fifo.can_push(): begin required");
+        return self.push_available;
+    }
+    fn can_pop(self) -> bool {
+        assert(self.active, "Fifo.can_pop(): begin required");
+        return self.pop_available;
+    }
+    fn push(self, data: T) {
+        val available = self.can_push();
+        assert(available, "Fifo.push(): can_push required");
+        if (available) {
+            self.slots[self.write_index] = data;
+            if (self.write_index == depth - 1) {
+                self.write_index = 0;
+            } else { self.write_index = self.write_index + 1; }
+            self.push_available = false;
+        }
+    }
+    fn peek(self) -> T {
+        val available = self.can_pop();
+        assert(available, "Fifo.peek(): can_pop required");
+        var data: T = undef;
+        if (available) { data = self.head; }
+        return data;
+    }
+    fn pop(self) -> T {
+        val data = self.peek();
+        if (self.can_pop()) {
+            if (self.read_index == depth - 1) {
+                self.read_index = 0;
+            } else { self.read_index = self.read_index + 1; }
+            self.pop_available = false;
+        }
+        return data;
+    }
+    fn end(self) {
+        assert(self.active, "Fifo.end(): begin required");
+        val old_level = self.level;
+        val pushed = old_level < depth && !self.push_available;
+        val popped = old_level > 0 && !self.pop_available;
+        // These guards preserve meaningful bounds without runtime modulo or
+        // assuming the compiler relates the snapshot flags to the old count.
+        if (pushed && !popped) {
+            assert(old_level < depth, "Fifo.end(): overflow");
+            if (old_level < depth) { self.level = old_level + 1; }
+        }
+        if (popped && !pushed) {
+            assert(old_level > 0, "Fifo.end(): underflow");
+            if (old_level > 0) { self.level = old_level - 1; }
+        }
+        self.active = false;
+    }
+}
+
+pub fn fifo(T: type, depth: int(2..) = 2) -> Fifo(T, depth) {
+    reg r_slots: [depth]T = undef;
+    // TODO(khdl#38): ordinary head field, initialized to undef each cycle.
+    reg r_head: T = undef;
+    reg r_read_index: uint(0..depth) = 0;
+    reg r_write_index: uint(0..depth) = 0;
+    reg r_level: uint(0..=depth) = 0;
+    // TODO(khdl#38): replace these flags with ordinary per-cycle fields.
+    // Registers work around mixed hardware/reference struct updates and keep
+    // reference targets alive across the binding function's return. Availability
+    // is overwritten by begin(); active only retains an extra lifecycle check.
+    reg r_push_available: bool = false;
+    reg r_pop_available: bool = false;
+    reg r_active: bool = false;
+    return Fifo(T, depth).new(
+        slots=ref(r_slots), head=ref(r_head), read_index=ref(r_read_index), write_index=ref(r_write_index),
+        level=ref(r_level), push_available=ref(r_push_available),
+        pop_available=ref(r_pop_available), active=ref(r_active),
+    );
+}
+
+// Lightweight stage. Immediate assignments intentionally permit push/pop
+// chaining within a process; applications must still check both predicates.
+pub struct Internal(T: type) {
+    ref slot: T,
+    ref valid: bool,
+    // TODO: ordinary per-cycle lifecycle field (see khdl#38 in endpoints.kh).
+    ref active: bool,
+
+    fn begin(self) {
+        assert(!self.active, "Internal.begin(): previous cycle not ended");
+        self.active = true;
+    }
+    fn end(self) {
+        assert(self.active, "Internal.end(): begin required");
+        self.active = false;
+    }
+    fn can_push(self) -> bool {
+        assert(self.active, "Internal.can_push(): begin required");
+        return !self.valid;
+    }
+    fn can_pop(self) -> bool {
+        assert(self.active, "Internal.can_pop(): begin required");
+        return self.valid;
+    }
+    fn push(self, data: T) {
+        val available = self.can_push();
+        assert(available, "Internal.push(): can_push required");
+        if (available) {
+            self.slot = data;
+            self.valid = true;
+        }
+    }
+    fn peek(self) -> T {
+        val available = self.can_pop();
+        assert(available, "Internal.peek(): can_pop required");
+        var data: T = undef;
+        if (available) { data = self.slot; }
+        return data;
+    }
+    fn pop(self) -> T {
+        val data = self.peek();
+        if (self.can_pop()) { self.valid = false; }
+        return data;
+    }
+}
+
+pub fn internal(T: type) -> Internal(T) {
+    reg r_slot: T = undef;
+    reg r_valid: bool = false;
+    // TODO: ordinary active=false field; slot/valid remain persistent state.
+    reg r_active: bool = false;
+    return Internal(T).new(slot=ref(r_slot), valid=ref(r_valid), active=ref(r_active));
+}
+
+// The algorithm sees the same FIFO-like operations for either implementation.
+// Depth one permits chaining; larger depths provide independent push/pop sides.
+pub fn storage(T: type, depth: positive = 1) -> any {
+    if (depth == 1) { return internal(T); }
+    else { return fifo(T, depth); }
+}

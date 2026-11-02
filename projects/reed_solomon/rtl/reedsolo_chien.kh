@@ -1,0 +1,225 @@
+// Structural port of reedsolo_chien_ent.vhd and _rtl.vhd.
+// Reset is synchronous; r_ variables retain state across rising edges.
+import reedsolo.[RsDefault];
+import reedsolo_interfaces.[RsTransaction, RsBerlekampBlock, RsChienBlock];
+
+pub module RsChien(unroll_omegas: positive = 1, unroll_chien: positive = 1, RS: type = RsDefault) ports(
+    // clock and synchronous reset
+    clk: in clock,
+    sync(clk) {
+        rst: in bool,
+        // inputs
+        input: interface RsTransaction(RsBerlekampBlock(RS=RS)).Sink,
+        // outputs
+        output: interface RsTransaction(RsChienBlock(unroll_chien, RS=RS)).Source,
+    }
+) {
+    const {
+        assert(RS.t % unroll_omegas == 0, "chien: RS.t % unroll_omegas == 0");
+    }
+    const c_omegas_cycles = RS.t +/ unroll_omegas;
+    const c_chien_cycles = RS.n +/ unroll_chien;
+    const c_chien_padding = c_chien_cycles * unroll_chien - RS.n;
+    const c_max_cycles = max(c_omegas_cycles, c_chien_cycles);
+    const c_bb_layers = clog2(unroll_chien);
+    const c_bb_width = 2**c_bb_layers;
+    const c_chien_table = generate_table(RS, unroll_chien);
+    wire r_input_ready_cond: sync(clk) bool;
+    wire r_input_ready_uncond: sync(clk) bool;
+    comb {
+        input.ready = (r_input_ready_cond && output.ready) || r_input_ready_uncond;
+    }
+    clocked(clk, sync rst) {
+        reg wire output.data = RsChienBlock(unroll_chien, RS=RS).new(
+            omegas=[RS.sym_zero] * RS.t,
+            lambdas=[RS.sym_zero] * (RS.t + 1),
+            error_cpos=[0] * RS.t,
+            error_upos=[0] * RS.t,
+            error_xinv=[RS.sym_zero] * RS.t,
+            num_errors=0,
+            failed=false,
+        );
+        reg wire output.valid = false;
+        reg wire r_input_ready_cond = true;
+        reg wire r_input_ready_uncond = true;
+        // output registers
+        reg r_fc_output_valid: bool = false;
+        // registers for processing
+        reg r_omegas: [RS.t]RS.Sym = [RS.sym_zero] * RS.t;
+        reg r_lambdas: [RS.t + 1]RS.Sym = [RS.sym_zero] * (RS.t + 1);
+        reg r_num_errors: uint(0..=2 * RS.t) = 0;
+        reg r_mask: [RS.t]bool = [false] * RS.t;
+        reg r_error_cpos: [RS.t]uint(RS.m) = [0] * RS.t;
+        reg r_error_upos: [RS.t]uint(0..unroll_chien) = [0] * RS.t;
+        reg r_error_xinv: [RS.t]RS.Sym = [RS.sym_zero] * RS.t;
+        reg r_error_counter: uint(0..=RS.t) = 0;
+        reg r_gammas: [RS.t]RS.Sym = [RS.sym_zero] * RS.t;
+        reg r_xinv: RS.Sym = RS.sym_one;
+        // butterfly balancer registers
+        reg r_bb_disp: [c_bb_width - 1]bool = [false] * (c_bb_width - 1);
+        // status registers
+        reg r_processing_omegas: bool = false;
+        reg r_processing_chien: bool = false;
+        reg r_progress_counter: uint(0..c_max_cycles) = 0;
+        // store incoming block
+        if (output.ready) {
+            r_fc_output_valid = false;
+        }
+        if (input.valid && !r_processing_omegas && !r_processing_chien && !r_fc_output_valid) {
+            r_omegas = input.data.syndromes[0..RS.t];
+            r_lambdas = input.data.lambdas;
+            r_num_errors = input.data.num_errors;
+            r_mask = [false] * r_mask.len;
+            // Cycle zero can contain real roots. Empty slots use an
+            // out-of-range cycle so correction never selects them.
+            r_error_cpos = [c_chien_cycles] * r_error_cpos.len;
+            r_error_upos = [0] * r_error_upos.len;
+            r_error_xinv = [RS.sym_zero] * r_error_xinv.len;
+            r_error_counter = 0;
+            r_gammas = input.data.lambdas[1..=RS.t];
+            r_xinv = RS.sym_one;
+            r_bb_disp = [false] * r_bb_disp.len;
+            r_processing_omegas = true;
+            r_processing_chien = true;
+            r_progress_counter = 0;
+        }
+        // calculate omegas
+        if (r_processing_omegas) {
+            for (i in 0..unroll_omegas) {
+                val v_coef = r_omegas[RS.t - 1];
+                for (j in 0..RS.t - unroll_omegas + i) {
+                    val v_temp = RS.gf_mul(r_lambdas[j + 1], v_coef);
+                    r_omegas[j] = r_omegas[j] ^ (v_temp * bool_to_int(r_mask[j]));
+                }
+                r_omegas[1..RS.t] = r_omegas[0..RS.t - 1];
+                r_omegas[0] = RS.gf_mul(v_coef, r_lambdas[0]);
+                r_mask[1..RS.t] = r_mask[0..RS.t - 1];
+                r_mask[0] = true;
+            }
+        }
+        // Chien search
+        if (r_processing_chien) {
+            // initialize butterfly balancer
+            var v_bb_flag = [false] * c_bb_width;
+            var v_bb_upos: [c_bb_width]uint(0..unroll_chien) = [0] * c_bb_width;
+            var v_bb_xinv: [c_bb_width]RS.Sym = [RS.sym_zero] * c_bb_width;
+            // determine errors
+            for (i in 0..unroll_chien) {
+                var v_subxinv: RS.Sym = undef;
+                var v_temp: RS.Sym = undef;
+                if (i == 0) {
+                    v_subxinv = r_xinv;
+                    v_temp = RS.sym_zero;
+                    for (j in 0..RS.t) {
+                        v_temp = v_temp ^ r_gammas[j];
+                    }
+                } else {
+                    v_subxinv = RS.gf_mul(r_xinv, RS.lut_exp[(-i) % (RS.q - 1)]);
+                    var v_reduce: RS.SymLong = RS.sym_zero_long;
+                    for (j in 0..RS.t) {
+                        val v_coef = c_chien_table[i - 1][j];
+                        v_reduce = v_reduce ^ RS.gf_mul_long(r_gammas[j], v_coef);
+                    }
+                    v_temp = RS.gf_reduce(v_reduce);
+                }
+                // Search the padded polynomial's coordinates. Compute all
+                // lanes, masking the initial padding before counting roots
+                // or feeding the butterfly, including field-period aliases.
+                if (v_temp == r_lambdas[0] && (r_progress_counter != 0 || i >= c_chien_padding)) {
+                    v_bb_flag[i] = true;
+                    // A correctable locator has at most RS.t roots. This polynomial
+                    // invariant cannot be proved by local integer range analysis.
+                    assert_assume(r_error_counter < RS.t, "Locator has too many roots");
+                    r_error_counter = r_error_counter + 1;
+                }
+                v_bb_upos[i] = i;
+                v_bb_xinv[i] = v_subxinv;
+            }
+            // butterfly balancer
+            for (l in 0..c_bb_layers) {
+                for (g in 0..2**(c_bb_layers - 1 - l)) {
+                    for (h in 0..2**l) {
+                        val v_ind1 = (2 * g + 0) * 2**l + h;
+                        val v_ind2 = (2 * g + 1) * 2**l + h;
+                        val v_disp = r_bb_disp[h + 2**l - 1];
+                        r_bb_disp[h + 2**l - 1] = v_disp ^^ v_bb_flag[v_ind1] ^^ v_bb_flag[v_ind2];
+                        if (!(v_disp ^^ v_bb_flag[v_ind1])) {
+                            val v_temp_flag = v_bb_flag[v_ind1];
+                            v_bb_flag[v_ind1] = v_bb_flag[v_ind2];
+                            v_bb_flag[v_ind2] = v_temp_flag;
+                            val v_temp_upos = v_bb_upos[v_ind1];
+                            v_bb_upos[v_ind1] = v_bb_upos[v_ind2];
+                            v_bb_upos[v_ind2] = v_temp_upos;
+                            val v_temp_xinv = v_bb_xinv[v_ind1];
+                            v_bb_xinv[v_ind1] = v_bb_xinv[v_ind2];
+                            v_bb_xinv[v_ind2] = v_temp_xinv;
+                        }
+                    }
+                }
+            }
+            // output shift registers
+            for (i in 0..min(c_bb_width, RS.t)) {
+                if (v_bb_flag[i]) {
+                    for (j_rev in 0..(RS.t - i - 1) / c_bb_width) {
+                        val j = ((RS.t - i - 1) / c_bb_width - 1) + (0) - j_rev;
+                        r_error_cpos[i + (j + 1) * c_bb_width] = r_error_cpos[i + j * c_bb_width];
+                        r_error_upos[i + (j + 1) * c_bb_width] = r_error_upos[i + j * c_bb_width];
+                        r_error_xinv[i + (j + 1) * c_bb_width] = r_error_xinv[i + j * c_bb_width];
+                    }
+                    r_error_cpos[i] = r_progress_counter;
+                    r_error_upos[i] = v_bb_upos[i];
+                    r_error_xinv[i] = v_bb_xinv[i];
+                }
+            }
+            // update gammas and xinv
+            for (j in 0..RS.t) {
+                val v_coef = c_chien_table[unroll_chien - 1][j];
+                r_gammas[j] = RS.gf_mul(r_gammas[j], v_coef);
+            }
+            r_xinv = RS.gf_mul(r_xinv, RS.lut_exp[(-unroll_chien) % (RS.q - 1)]);
+        }
+        // update progress counter
+        if (r_processing_omegas || r_processing_chien) {
+            if (r_progress_counter == c_omegas_cycles - 1) {
+                r_processing_omegas = false;
+            }
+            if (r_progress_counter == c_chien_cycles - 1) {
+                r_processing_chien = false;
+            }
+            if (r_progress_counter == c_max_cycles - 1) {
+                r_progress_counter = 0;
+                r_fc_output_valid = true;
+            } else {
+                r_progress_counter = r_progress_counter + 1;
+            }
+        }
+        // output data from updated register variables
+        if (!r_processing_omegas && !r_processing_chien) {
+            r_input_ready_cond = true;
+            r_input_ready_uncond = !r_fc_output_valid;
+        } else {
+            r_input_ready_cond = false;
+            r_input_ready_uncond = false;
+        }
+        output.data = RsChienBlock(unroll_chien, RS=RS).new(
+            omegas=r_omegas,
+            lambdas=r_lambdas,
+            error_cpos=r_error_cpos,
+            error_upos=r_error_upos,
+            error_xinv=r_error_xinv,
+            num_errors=r_error_counter,
+            failed=r_num_errors != r_error_counter,
+        );
+        output.valid = r_fc_output_valid;
+    }
+}
+
+fn generate_table(RS: type, unroll_chien: positive) -> [unroll_chien][RS.t]RS.Sym {
+    var v_table: [unroll_chien][RS.t]RS.Sym = [[0] * (RS.t)] * unroll_chien;
+    for (i in 0..unroll_chien) {
+        for (j in 0..RS.t) {
+            v_table[i][j] = RS.lut_exp[((1 + i) * (-1 - j)) % (RS.q - 1)];
+        }
+    }
+    return v_table;
+}

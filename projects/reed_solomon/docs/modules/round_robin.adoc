@@ -1,0 +1,99 @@
+[[reed-solomon-round-robin]]
+=== RsRoundRobinDispatch and RsRoundRobinCollect
+
+Source: `rtl/reedsolo_round_robin.kh`.
+
+==== Function and interfaces
+
+`RsRoundRobinDispatch` sends successive ready/valid transactions to workers
+`0,1,...,count-1,0,...`. `RsRoundRobinCollect` receives results in that same
+order. Each owns one transfer counter with active-high synchronous reset to
+zero. Payload and handshake routing are combinational: neither module stores
+a transaction or adds a pipeline cycle.
+
+The routing unit is one transaction, not one frame identified by `last`.
+For decoder block interfaces each transaction contains a whole frame.
+The routers accept `RsTransaction(T)`; symbol streams use the separate
+`RsStream` interface.
+
+`RsRoundRobinDispatch` has one `input: RsTransaction(T).Sink` and computed ports
+`output_0` through `output_{count-1}`, each `RsTransaction(T).Source`. Payload is broadcast
+to all workers; only the selected worker receives `valid`. Input `ready`
+is the selected worker's `ready`. The counter advances only when both input
+`valid` and input `ready` are asserted at a rising edge.
+
+`RsRoundRobinCollect` has computed ports `input_0` through `input_{count-1}`,
+each `RsTransaction(T).Sink`, and one `output: RsTransaction(T).Source`. It selects the expected worker's
+payload and `valid`, and returns output `ready` only to that worker. Its
+counter advances only on an output transfer. Later results wait in their
+workers, even when the expected worker has not yet finished. Both counters
+use a terminal comparison and reset to zero rather than runtime modulo.
+
+[cols="1,3",options="header"]
+|===
+|Parameter |Contract
+|T |Hardware payload type carried in `data`, normally a stage block struct. `RsTransaction(T)` explicitly declares the ready/valid protocol.
+|count |Positive number of workers, including one and non-power-of-two values.
+|===
+
+`clk` and `rst` control only the selection counter. A combinational path
+can be active while reset is asserted; reset is effective at the rising edge,
+following the common synchronous-reset contract. Reset both routers and all
+workers together. Workers must return exactly one result per accepted input
+and hold result payload/valid until accepted. The dispatcher and collector
+must use the same count and worker order. Payloads are forwarded as whole `data` values; adding a struct field requires
+no router change.
+
+==== Timing
+
+The following `RsRoundRobinDispatch` example transfers A to worker 0 at edge
+0, B to worker 1 at edge 1, C to worker 0 at edge 3, and D to worker 1 at
+edge 5. The selection counter holds through each stall.
+
+[wavedrom]
+....
+{"signal":[
+  {"name":"clk","wave":"p......."},
+  {"name":"input.valid","wave":"1.....0."},
+  {"name":"input.data","wave":"234.5.x.","data":["A","B","C","D"]},
+  {"name":"input.ready","wave":"1.0101.."},
+  {"name":"selection","wave":"232.3.2.","data":["0","1","0","1","0"]},
+  {"name":"output_0.valid","wave":"101.0..."},
+  {"name":"output_0.ready","wave":"1.01...."},
+  {"name":"output_1.valid","wave":"010.1.0."},
+  {"name":"output_1.ready","wave":"1...01.."}
+],"head":{"text":"RsRoundRobinDispatch: two workers","tick":0}}
+....
+
+In the `RsRoundRobinCollect` example, worker 1 already has B at edge 0, but
+worker 0 supplies A only at edge 1. The output waits for A, then transfers
+B at edge 2. C waits for downstream ready and transfers at edge 5; D follows
+at edge 6. Selection and output payload remain stable through the stall.
+
+[wavedrom]
+....
+{"signal":[
+  {"name":"clk","wave":"p......."},
+  {"name":"input_0.valid","wave":"010.1.0."},
+  {"name":"input_1.valid","wave":"1..0..10"},
+  {"name":"selection","wave":"2.32..32","data":["0","1","0","1","0"]},
+  {"name":"output.valid","wave":"01.01..0"},
+  {"name":"output.ready","wave":"1...01.."},
+  {"name":"output.data","wave":"x23x4.5x","data":["A","B","C","D"]},
+  {"name":"input_0.ready","wave":"1.010101"},
+  {"name":"input_1.ready","wave":"0.10..10"}
+],"head":{"text":"RsRoundRobinCollect: ordered results","tick":0}}
+....
+
+==== Constraints and implementation cost
+
+These modules provide strict round-robin routing, not a work-stealing
+scheduler or a reorder buffer. A busy selected worker blocks dispatch even
+if another worker is free. The collector likewise waits for its selected
+worker. Variable worker latency can therefore reduce throughput; the fixed
+iteration counts of `RsBerlekamp` and `RsForney` suit this scheme.
+
+The dispatcher adds selection decoding and a ready multiplexer; the collector
+adds a payload/valid multiplexer and ready decoding. The collector's payload
+path is combinational even though the workers register their outputs.
+Logic and fanout grow with worker count and payload width.
