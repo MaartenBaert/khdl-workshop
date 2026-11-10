@@ -890,3 +890,39 @@ async def lite_copy(dut):
         await send(dut, 'command', [source | destination << 32 | length << 64 | tag << 97])
         assert (await result)[0] == tag
         assert ram_model.read(destination, length) == data
+
+
+@cocotb.test(timeout_time=300, timeout_unit='us')
+async def lite_router(dut):
+    """AxiRouter on AXI4-Lite: the Subordinate and pooled Manager keep every
+    response in issue order on both sides, with independent stalls."""
+    cocotb.start_soon(Clock(dut.clk, 10, unit='ns').start())
+    master = AxiLiteMaster(AxiLiteBus.from_prefix(dut, 's_axi'), dut.clk, dut.aresetn,
+                           reset_active_level=False)
+    memories = [AxiLiteRam(AxiLiteBus.from_prefix(dut, f'm{i}_axi'), dut.clk, dut.aresetn,
+                           reset_active_level=False, size=4096) for i in range(2)]
+    for i, model in enumerate(memories):
+        pause_lite(([model.write_if.aw_channel, model.write_if.w_channel, model.write_if.b_channel,
+                     model.read_if.ar_channel, model.read_if.r_channel], [i, 1, 0, 0, 1, 0]))
+    await reset(dut)
+    pause_lite(([master.write_if.aw_channel, master.write_if.w_channel, master.read_if.ar_channel,
+                 master.write_if.b_channel, master.read_if.r_channel], [0, 1, 0, 0, 1]))
+    for address, length in [(0, 29), (4092, 64), (5000, 300)]:
+        data = bytes((i * 17 + address) % 256 for i in range(length))
+        assert (await master.write(address, data)).resp == 0
+        response = await master.read(address, length)
+        assert response.resp == 0 and response.data == data
+        for i, byte in enumerate(data):
+            absolute = address + i
+            assert memories[absolute // 4096].read(absolute % 4096, 1) == bytes([byte])
+    # Concurrent transactions alternating between the two downstream ports.
+    operations = [master.init_write((i % 2) * 4096 + 64 * i, bytes([i + 1]) * 12) for i in range(9)]
+    for operation in operations:
+        await operation.wait()
+        assert operation.data.resp == 0
+    operations = [master.init_read((i % 2) * 4096 + 64 * i, 12) for i in range(9)]
+    for i, operation in enumerate(operations):
+        await operation.wait()
+        assert operation.data.data == bytes([i + 1]) * 12
+    assert (await master.write(8192, bytes(8))).resp == 3
+    assert (await master.read(8192, 8)).resp == 3

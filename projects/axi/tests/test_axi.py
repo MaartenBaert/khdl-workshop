@@ -271,6 +271,16 @@ def test_router_independent_axi_peers(tmp_path, depth):
         'output0': ('m0_axi', 'Manager'), 'output1': ('m1_axi', 'Manager')}, 'router')
 
 
+@pytest.mark.parametrize('depth', [1, 2])
+def test_lite_router_independent_peers(tmp_path, depth):
+    compiler = khdl.Source.new_from_manifest_path(str(MANIFEST)).compile()
+    config = protocol_config(compiler, 'Lite', 32, id_width=0, addr_width=16)
+    verilog = compiler.resolve('examples.router.AxiRouter')(config, capacity=3, queue_depth=depth).as_verilog()
+    run_cocotb(tmp_path, verilog, config, {
+        'input': ('s_axi', 'Subordinate'),
+        'output0': ('m0_axi', 'Manager'), 'output1': ('m1_axi', 'Manager')}, 'lite_router')
+
+
 def test_subordinate_reordering_and_same_id_order(tmp_path):
     source = khdl.Source.new_from_manifest_path(str(MANIFEST))
     probe = Path(__file__).parent / 'rtl/reorder.kh'
