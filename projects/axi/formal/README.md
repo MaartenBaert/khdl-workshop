@@ -18,6 +18,18 @@ depth; the `manager` default takes a few minutes. The pytest suite proves the
 any number of cycles instead. It succeeds quickly for `pipeline`; for `error`
 and `manager` it has not finished within 20 minutes.
 
+## AXI3 and AXI4-Lite
+
+`--protocol axi3|lite` (targets `error` and `manager`) checks the same designs on
+the other protocols. `axi_protocol_view.sv` embeds each payload in the AXI4
+layout for the unchanged monitor and adds the AXI3 rules: AxLOCK 3 reserved,
+and WID consistency (all beats of a burst share a WID, and the k-th W burst's
+WID equals the k-th AWID, also when W precedes AW). Verified 2026-11-10 at the
+default depths, with ABC: `error` and `manager` pass with reachability on both
+protocols; the RLAST, reserved-BURST, and (AXI3) `--inject-fault wid` negative
+controls fail with `rlast_ok`, `ar_legal_ok`, and `wid_ok`. These runs are not
+yet part of `tests/test_formal.py`.
+
 ## Engines
 
 `--engine abc` is the default when ABC (`yosys-abc` or `abc`) and

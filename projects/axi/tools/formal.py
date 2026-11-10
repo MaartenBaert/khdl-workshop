@@ -11,7 +11,10 @@ Targets:
             protocol monitor, with an arbitrary legal Subordinate.
 
 Protocol rules come from formal/axi4_protocol.sv, written from the AXI
-specification. Design contracts are separate, named assertions in the harness.
+specification. For AXI3 and AXI4-Lite (--protocol, error and manager targets),
+formal/axi_protocol_view.sv embeds the payloads in the AXI4 layout and adds the
+AXI3 rules (AxLOCK 3 reserved, WID). Design contracts are separate, named
+assertions in the harness.
 Reset is assumed in the first cycle and is unconstrained afterwards.
 
 Real RTL exports are preserved. The formal-only copy turns each KHDL assertion
@@ -24,6 +27,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+from types import SimpleNamespace
 
 import khdl
 
@@ -32,13 +36,16 @@ from .axi_wrapper import payload_fields
 PROJECT = Path(__file__).resolve().parents[1]
 MANIFEST = PROJECT / 'rtl/khdl.toml'
 MONITOR = PROJECT / 'formal/axi4_protocol.sv'
+VIEW = PROJECT / 'formal/axi_protocol_view.sv'
+PROTOCOLS = ('axi4', 'axi3', 'lite')
 MANAGER_FACADE = PROJECT / 'formal/manager.kh'
 TARGETS = ('pipeline', 'error', 'manager')
 ENGINES = ('abc', 'sat')
 FAULTS = {
     'pipeline': 'invert the forwarded AW payload',
     'error': 'flip RLAST as seen by the protocol monitor',
-    'manager': 'mark AR bursts as the reserved BURST encoding',
+    'manager': 'mark AR bursts as the reserved BURST encoding (with --inject-fault wid on AXI3: '
+               'flip the low WID bit on the bus)',
 }
 # Default proof depths: cycles after the initial reset. Runtime grows steeply
 # with depth: with ABC the manager default takes minutes, and Yosys's built-in
@@ -132,9 +139,47 @@ def top_module(module_name, ports, body, extra_ports=()):
 ''' + body + 'endmodule\n')
 
 
+def view_config(config):
+    """The AXI4 layout the monitor sees: the bus itself, or the embedding of
+    an AXI3/AXI4-Lite bus by axi_protocol_view (Lite: one constant ID bit)."""
+    if not (config.axi3 or config.lite):
+        return config
+    return SimpleNamespace(lite=False, axi3=False, id_width=1 if config.lite else config.id_width,
+                           addr_width=config.addr_width, data_width=config.data_width,
+                           bytes=config.bytes, awuser_width=0, wuser_width=0, buser_width=0,
+                           aruser_width=0, ruser_width=0)
+
+
+def monitor_view(config, prefix, dut_is_manager, *, max_writes, max_early, native=None):
+    """Wires mon_aw..mon_r carrying the AXI4 view of bus `prefix`. `native`
+    overrides bus payloads before the view (fault injection on the wire)."""
+    native = native or {}
+    channels = ('aw', 'w', 'b', 'ar', 'r')
+    source = {c: native.get(c, f'{prefix}_{c}') for c in channels}
+    view = view_config(config)
+    widths = {c: sum(w for _, w in payload_fields(view)[c]) for c in channels}
+    text = ''.join(f'    wire [{widths[c]-1}:0] mon_{c};\n' for c in channels)
+    if view is config:
+        return text + ''.join(f'    assign mon_{c} = {source[c]};\n' for c in channels)
+    assert config.awuser_width == config.wuser_width == config.buser_width == 0
+    assert config.aruser_width == config.ruser_width == 0
+    parameters = {'PROTOCOL': 2 if config.lite else 1, 'ID_WIDTH': config.id_width,
+                  'ADDR_WIDTH': config.addr_width, 'DATA_WIDTH': config.data_width,
+                  'DUT_IS_MANAGER': int(dut_is_manager), 'MAX_WRITES': max_writes,
+                  'MAX_EARLY_BEATS': max_early}
+    ports = [f'.{c}({source[c]}), .{c}valid({prefix}_{c}valid), .{c}ready({prefix}_{c}ready)'
+             for c in channels]
+    return (text + '    axi_protocol_view #(' + ', '.join(f'.{k}({v})' for k, v in parameters.items())
+            + ') view(.clk(clk), .rst(rst), ' + ', '.join(ports) + ', '
+            + ', '.join(f'.{c}4(mon_{c})' for c in channels) + ');\n')
+
+
 def protocol_monitor(config, prefix, dut_is_manager, *, max_reads, max_writes, max_early,
                      override=None):
+    """The AXI4 monitor on the view wires mon_*; `override` replaces a view
+    payload as the monitor sees it (fault injection on the observation)."""
     override = override or {}
+    config = view_config(config)
     parameters = {
         'ID_WIDTH': config.id_width, 'ADDR_WIDTH': config.addr_width,
         'DATA_WIDTH': config.data_width, 'AWUSER_WIDTH': config.awuser_width,
@@ -143,7 +188,8 @@ def protocol_monitor(config, prefix, dut_is_manager, *, max_reads, max_writes, m
         'DUT_IS_MANAGER': int(dut_is_manager), 'MAX_READS': max_reads,
         'MAX_WRITES': max_writes, 'MAX_EARLY_BEATS': max_early,
     }
-    signals = [(f'{channel}{suffix}', override.get(channel + suffix, f'{prefix}_{channel}{suffix}'))
+    signals = [(f'{channel}{suffix}', override.get(channel + suffix,
+                f'mon_{channel}' if suffix == '' else f'{prefix}_{channel}{suffix}'))
                for channel in ('aw', 'w', 'b', 'ar', 'r') for suffix in ('', 'valid', 'ready')]
     return ('    axi4_protocol #(' + ', '.join(f'.{k}({v})' for k, v in parameters.items())
             + ') protocol(.clk(clk), .rst(rst), '
@@ -221,58 +267,84 @@ def field_width(config, channel):
 
 
 def error_harness(module_name, ports, config, inject_fault):
-    b_resp, _ = field(config, 'b', 'resp')
-    r_resp, _ = field(config, 'r', 'resp')
-    r_last, _ = field(config, 'r', 'last')
+    view = view_config(config)
+    b_resp, _ = field(view, 'b', 'resp')
+    r_resp, _ = field(view, 'r', 'resp')
+    r_last, _ = field(view, 'r', 'last')
     override = {}
-    body = ''
+    body = monitor_view(config, 'bus', False, max_writes=4, max_early=2)
     if inject_fault:
-        body += (f"    wire [{field_width(config, 'r')-1}:0] bus_r_seen = "
-                 f"bus_r ^ ({field_width(config, 'r')}'d1 << {r_last});\n")
-        override['r'] = 'bus_r_seen'
+        body += (f"    wire [{field_width(view, 'r')-1}:0] mon_r_seen = "
+                 f"mon_r ^ ({field_width(view, 'r')}'d1 << {r_last});\n")
+        override['r'] = 'mon_r_seen'
     body += protocol_monitor(config, 'bus', False, max_reads=4, max_writes=4, max_early=2,
                              override=override)
+    # AXI4-Lite has single-beat reads: a completed read stands in for a burst.
+    burst = 'seen_r' if config.lite else 'seen_burst'
     body += f'''    // AxiError contract (design, not AXI rules): every response is DECERR.
-    wire decerr_ok = rst || ((!bus_rvalid || bus_r[{r_resp}+:2] == 2'd3)
-        && (!bus_bvalid || bus_b[{b_resp}+:2] == 2'd3));
+    wire decerr_ok = rst || ((!bus_rvalid || mon_r[{r_resp}+:2] == 2'd3)
+        && (!bus_bvalid || mon_b[{b_resp}+:2] == 2'd3));
     always @(*) assert(decerr_ok);
     // Reachability: early W, two outstanding requests on one side, a completed
-    // multi-beat read, and a write response.
-    reg seen_early_w = 1'b0, seen_overlap = 1'b0, seen_burst = 1'b0, seen_b = 1'b0;
+    // multi-beat read (AXI4-Lite: a read), and a write response.
+    reg seen_early_w = 1'b0, seen_overlap = 1'b0, seen_burst = 1'b0, seen_b = 1'b0, seen_r = 1'b0;
     reg read_midburst = 1'b0;
     always @(posedge clk) if (rst) begin
         seen_early_w <= 1'b0; seen_overlap <= 1'b0; seen_burst <= 1'b0; seen_b <= 1'b0;
-        read_midburst <= 1'b0;
+        seen_r <= 1'b0; read_midburst <= 1'b0;
     end else begin
         if (early_beats != 0) seen_early_w <= 1'b1;
         if (reads_outstanding >= 2 || writes_outstanding >= 2) seen_overlap <= 1'b1;
         if (bus_rvalid && bus_rready) begin
-            read_midburst <= !bus_r[{r_last}];
-            if (bus_r[{r_last}] && read_midburst) seen_burst <= 1'b1;
+            seen_r <= 1'b1;
+            read_midburst <= !mon_r[{r_last}];
+            if (mon_r[{r_last}] && read_midburst) seen_burst <= 1'b1;
         end
         if (bus_bvalid && bus_bready) seen_b <= 1'b1;
     end
-    assign reached = seen_early_w && seen_overlap && seen_burst && seen_b;
+    assign reached = seen_early_w && seen_overlap && {burst} && seen_b;
 '''
     show = ['decerr_ok'] + [f'protocol.{rule}' for rule in MONITOR_RULES]
     return top_module(module_name, ports, body, ['output reached']), 'reached', show
 
 
 def manager_harness(module_name, ports, config, inject_fault):
-    r_last, _ = field(config, 'r', 'last')
-    r_id, _ = field(config, 'r', 'id')
-    override = {}
-    body = ''
-    if inject_fault:
-        burst, _ = field(config, 'ar', 'burst')
-        body += (f"    wire [{field_width(config, 'ar')-1}:0] bus_ar_seen = "
-                 f"bus_ar | ({field_width(config, 'ar')}'d3 << {burst});\n")
-        override['ar'] = 'bus_ar_seen'
+    view = view_config(config)
+    r_last, _ = field(view, 'r', 'last')
+    r_id, _ = field(view, 'r', 'id')
+    override, native, body = {}, {}, ''
+    if inject_fault == 'wid':
+        if not config.axi3:
+            raise ValueError('the WID fault applies to AXI3 only')
+        body += f"    wire [{field_width(config, 'w')-1}:0] bus_w_seen = bus_w ^ 1;\n"
+        native['w'] = 'bus_w_seen'
     # Two endpoints of capacity two per direction: at most four outstanding
     # transactions per direction. The Manager presents AW before its W beats,
     # so no beat precedes its AW; the capacity rule would show otherwise.
+    body += monitor_view(config, 'bus', True, max_writes=4, max_early=1, native=native)
+    if inject_fault and inject_fault != 'wid':
+        burst, _ = field(view, 'ar', 'burst')
+        body += (f"    wire [{field_width(view, 'ar')-1}:0] mon_ar_seen = "
+                 f"mon_ar | ({field_width(view, 'ar')}'d3 << {burst});\n")
+        override['ar'] = 'mon_ar_seen'
     body += protocol_monitor(config, 'bus', True, max_reads=4, max_writes=4, max_early=1,
                              override=override)
+    if config.lite:
+        # No IDs or bursts: two reads outstanding at once, a read, and a write.
+        body += '''    // Reachability: two outstanding reads (from both endpoints, routed by
+    // issue order), a completed read, and a write response.
+    reg seen_overlap = 1'b0, seen_r = 1'b0, seen_b = 1'b0;
+    always @(posedge clk) if (rst) begin
+        seen_overlap <= 1'b0; seen_r <= 1'b0; seen_b <= 1'b0;
+    end else begin
+        if (reads_outstanding >= 2) seen_overlap <= 1'b1;
+        if (bus_rvalid && bus_rready) seen_r <= 1'b1;
+        if (bus_bvalid && bus_bready) seen_b <= 1'b1;
+    end
+    assign reached = seen_overlap && seen_r && seen_b;
+'''
+        show = [f'protocol.{rule}' for rule in MONITOR_RULES]
+        return top_module(module_name, ports, body, ['output reached']), 'reached', show
     body += f'''    // Reachability: R beats of both IDs interleaved within an open burst,
     // a completed multi-beat read, and a write response.
     reg seen_interleave = 1'b0, seen_burst = 1'b0, seen_b = 1'b0;
@@ -281,10 +353,10 @@ def manager_harness(module_name, ports, config, inject_fault):
         seen_interleave <= 1'b0; seen_burst <= 1'b0; seen_b <= 1'b0; read_midburst <= 1'b0;
     end else begin
         if (bus_rvalid && bus_rready) begin
-            if (read_midburst && bus_r[{r_id}] != burst_id) seen_interleave <= 1'b1;
-            if (!read_midburst) burst_id <= bus_r[{r_id}];
-            if (bus_r[{r_last}] && read_midburst && bus_r[{r_id}] == burst_id) seen_burst <= 1'b1;
-            if (!read_midburst || bus_r[{r_id}] == burst_id) read_midburst <= !bus_r[{r_last}];
+            if (read_midburst && mon_r[{r_id}] != burst_id) seen_interleave <= 1'b1;
+            if (!read_midburst) burst_id <= mon_r[{r_id}];
+            if (mon_r[{r_last}] && read_midburst && mon_r[{r_id}] == burst_id) seen_burst <= 1'b1;
+            if (!read_midburst || mon_r[{r_id}] == burst_id) read_midburst <= !mon_r[{r_last}];
         end
         if (bus_bvalid && bus_bready) seen_b <= 1'b1;
     end
@@ -294,12 +366,18 @@ def manager_harness(module_name, ports, config, inject_fault):
     return top_module(module_name, ports, body, ['output reached']), 'reached', show
 
 
-def elaborate(target, config_args):
+def elaborate(target, config_args, protocol='axi4'):
     source = khdl.Source.new_from_manifest_path(str(MANIFEST))
     if target == 'manager':
         source.add_file_content(['formal_manager'], str(MANAGER_FACADE), MANAGER_FACADE.read_text())
     compiler = source.compile()
-    config = compiler.resolve('axi.types.axi_config')(**config_args)
+    enum = getattr(compiler.resolve('axi.types.Protocol'), {'axi4': 'Axi4', 'axi3': 'Axi3', 'lite': 'Lite'}[protocol])
+    a = dict(config_args)
+    if protocol == 'lite':
+        a['id_width'] = 0
+        a['data_width'] = max(32, a['data_width'])   # AXI4-Lite: 32 or 64 bits
+    config = compiler.resolve('axi.types.axi_config')(a['addr_width'], a['data_width'], a['id_width'],
+                                                      0, 0, 0, 0, 0, enum)
     if target == 'pipeline':
         module = compiler.resolve('examples.pipeline.AxiPipeline')(config)
     elif target == 'error':
@@ -455,7 +533,7 @@ def prove(out, verilog_source, module_name, harness, depth, reach=None, show=(),
     adapted, failures = assertion_adapter(verilog_source)
     (out / 'design.formal.v').write_text(adapted)
     (out / 'harness.sv').write_text(harness)
-    files = ['design.formal.v', str(MONITOR), 'harness.sv']
+    files = ['design.formal.v', str(MONITOR), str(VIEW), 'harness.sv']
     # One reset cycle, `depth` checked cycles, one step for sticky KHDL flags.
     steps = depth + 2
     reach_steps = (depth if reach_depth is None else reach_depth) + 2
@@ -471,18 +549,22 @@ def prove(out, verilog_source, module_name, harness, depth, reach=None, show=(),
 
 
 def check(out, depth=None, *, inject_fault=False, target='pipeline', engine=None,
-          unbounded=False):
+          unbounded=False, protocol='axi4'):
+    """inject_fault: False, True (the target's negative control), or 'wid'
+    (manager on AXI3)."""
+    if protocol != 'axi4' and target == 'pipeline':
+        raise ValueError('the pipeline target checks AXI4 transport only')
     depth = DEPTHS[target] if depth is None else depth
     reach_depth = max(depth, REACH_DEPTHS[target])
     engine = engine or default_engine()
-    config, verilog = elaborate(target, CONFIGS[target])
+    config, verilog = elaborate(target, CONFIGS[target], protocol)
     harness, reach, show = HARNESSES[target](
         verilog.module_name, module_ports(verilog.source, verilog.module_name), config, inject_fault)
     failures = prove(out, verilog.source, verilog.module_name, harness, depth,
                      None if inject_fault else reach, show, reach_depth,
                      engine=engine, unbounded=unbounded)
     scope = 'all cycles after reset' if unbounded else f'{depth} cycles after reset'
-    print(f'{target} {"unbounded proof" if unbounded else "bounded checks"} passed ({engine}): '
+    print(f'{target} ({protocol}) {"unbounded proof" if unbounded else "bounded checks"} passed ({engine}): '
           f'{scope}; {failures} KHDL assertion paths preserved'
           + (f'; reachability shown in {reach_depth} cycles' if reach and not inject_fault else ''))
 
@@ -491,6 +573,8 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--target', choices=TARGETS, default='pipeline')
+    parser.add_argument('--protocol', choices=PROTOCOLS, default='axi4',
+                        help='bus protocol for the error and manager targets (default axi4)')
     parser.add_argument('--out', type=Path)
     parser.add_argument('--depth', type=int,
                         help='cycles after reset (default: '
@@ -499,7 +583,7 @@ if __name__ == '__main__':
                         help='abc (ABC bmc3/pdr, the default when installed) or sat (Yosys built-in)')
     parser.add_argument('--unbounded', action='store_true',
                         help='prove for all depths with ABC PDR; may not terminate')
-    parser.add_argument('--inject-fault', action='store_true',
+    parser.add_argument('--inject-fault', nargs='?', const=True, default=False, choices=[True, 'wid'],
                         help='negative control; the check must fail: '
                              + '; '.join(f'{t}: {d}' for t, d in FAULTS.items()))
     args = parser.parse_args()
@@ -508,8 +592,9 @@ if __name__ == '__main__':
     if args.unbounded and (args.engine or default_engine()) != 'abc':
         parser.error('--unbounded requires the abc engine (ABC and yosys-witness)')
     try:
-        check(args.out or Path('build/axi/formal') / args.target, args.depth,
+        name = args.target if args.protocol == 'axi4' else f'{args.target}-{args.protocol}'
+        check(args.out or Path('build/axi/formal') / name, args.depth,
               inject_fault=args.inject_fault, target=args.target, engine=args.engine,
-              unbounded=args.unbounded)
+              unbounded=args.unbounded, protocol=args.protocol)
     except ProofFailed as error:
         raise SystemExit(f'{args.target}: proof failed: {error}')
