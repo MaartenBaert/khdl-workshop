@@ -43,12 +43,14 @@ pub fn check_examples() {
         EndpointManagerCheck(C3);
         AxiRouter(C3, capacity=2);
     }
-    // AXI4-Lite: Subordinate-side examples and the pooled (order-matched) Manager.
+    // AXI4-Lite: responses matched by issue order in both Managers.
     for (width in [32, 64]) {
         val CL = axi_config(addr_width=16, data_width=width, id_width=0,
             awuser_width=0, wuser_width=0, buser_width=0, aruser_width=0, ruser_width=0,
             protocol=Protocol.Lite);
         AxiPipeline(CL);
+        AxiCopy(CL);
+        EndpointManagerCheck(CL);
         AxiRam(CL, memory_bytes=128, capacity=2);
         AxiError(CL, capacity=2);
         AxiRouter(CL, capacity=2);
@@ -70,7 +72,7 @@ module EndpointManagerCheck(C: type = AxiDefault) ports(
         val api = manager(C, ref(bus), reads=(descriptors, payloads), writes=(writes,));
         api.begin();
         if (descriptors.can_push()) { descriptors.push(read_request(C, 0)); }
-        if (payloads.can_push()) { payloads.push(read_request(C, 0, beats=2)); }
+        if (payloads.can_push()) { payloads.push(read_request(C, 0, beats=min(2, C.max_beats))); }
         if (writes.can_push()) { writes.push(write_request(C, 0)); }
         if (descriptors.can_pop()) { val _ = descriptors.pop(); }
         if (payloads.can_pop()) { val _ = payloads.pop(); }

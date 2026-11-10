@@ -24,16 +24,24 @@ pub struct ManagerReadEndpoint(C: type, endpoint_id: uint, capacity: positive, r
     contexts: ContextQueue(ReadContext, capacity),
 
     fn validate(write: bool) { assert(!write, "read endpoint bound as a writer"); }
-    fn begin(self, input: Receiver(C.R)) {
+    // The Manager routes each received R beat (by RID, or by issue order on
+    // AXI4-Lite) and offers it with its route; returns true when taken here.
+    fn begin(self, input: Receiver(C.R), routed: bool, route: any) -> bool {
         self.requests.begin(); self.responses.begin();
-        if (input.can_pop()) {
-            val beat = input.peek();
-            if (C.id_of(beat) == endpoint_id && self.responses.can_push()) { self.responses.push(input.pop()); }
+        var taken = false;
+        if (routed && input.can_pop()) {
+            if (route == endpoint_id && self.responses.can_push()) {
+                self.responses.push(input.pop());
+                taken = true;
+            }
         }
+        return taken;
     }
-    fn flush_ar(self, output: Transmitter(C.Ar)) -> bool {
-        if (self.requests.can_pop() && output.can_push()) {
+    // AXI4-Lite: record the issuing endpoint, in bus order, for routing R.
+    fn flush_ar(self, output: Transmitter(C.Ar), issued: any) -> bool {
+        if (self.requests.can_pop() && output.can_push() && issued.can_push()) {
             output.push(self.requests.pop());
+            if (C.lite) { val _ = issued.push(endpoint_id); }
             return true;
         }
         return false;
@@ -97,17 +105,23 @@ pub struct ManagerWriteEndpoint(C: type, endpoint_id: uint, capacity: positive, 
     ref data_lasts: uint(0..=data_depth),
 
     fn validate(write: bool) { assert(write, "write endpoint bound as a reader"); }
-    fn begin(self, input: Receiver(C.B)) {
+    fn begin(self, input: Receiver(C.B), routed: bool, route: any) -> bool {
         self.requests.begin(); self.data.begin(); self.responses.begin();
-        if (input.can_pop()) {
-            val response = input.peek();
-            if (C.id_of(response) == endpoint_id && self.responses.can_push()) { self.responses.push(input.pop()); }
+        var taken = false;
+        if (routed && input.can_pop()) {
+            if (route == endpoint_id && self.responses.can_push()) {
+                self.responses.push(input.pop());
+                taken = true;
+            }
         }
+        return taken;
     }
-    fn flush_aw(self, output: Transmitter(C.Aw), order: any) -> bool {
-        if (self.requests.can_pop() && output.can_push() && order.can_push()) {
+    // order: W ownership (all protocols); issued: B routing (AXI4-Lite only).
+    fn flush_aw(self, output: Transmitter(C.Aw), order: any, issued: any) -> bool {
+        if (self.requests.can_pop() && output.can_push() && order.can_push() && issued.can_push()) {
             output.push(self.requests.pop());
             val _ = order.push(endpoint_id);
+            if (C.lite) { val _ = issued.push(endpoint_id); }
             return true;
         }
         return false;
@@ -229,7 +243,8 @@ pub struct ManagerWriteEndpoint(C: type, endpoint_id: uint, capacity: positive, 
 pub fn read_endpoint(C: type, id: uint = 0, capacity: positive = 1,
     response_depth: positive = 1, request_depth: positive = 1)
     -> ManagerReadEndpoint(C, id, capacity, response_depth, request_depth) {
-    const { assert(id < 2**C.id_width, "Manager endpoint ID exceeds bus width"); }
+    // AXI4-Lite IDs are local routing labels and never appear on the bus.
+    const { assert(C.lite || id < 2**C.id_width, "Manager endpoint ID exceeds bus width"); }
     return ManagerReadEndpoint(C, id, capacity, response_depth, request_depth).new(
         requests=storage(C.Ar, request_depth), responses=storage(C.R, response_depth),
         contexts=context_queue(ReadContext, capacity));
@@ -237,7 +252,7 @@ pub fn read_endpoint(C: type, id: uint = 0, capacity: positive = 1,
 pub fn write_endpoint(C: type, id: uint = 0, capacity: positive = 1,
     response_depth: positive = 1, request_depth: positive = 1, data_depth: positive = 1)
     -> ManagerWriteEndpoint(C, id, capacity, response_depth, request_depth, data_depth) {
-    const { assert(id < 2**C.id_width, "Manager endpoint ID exceeds bus width"); }
+    const { assert(C.lite || id < 2**C.id_width, "Manager endpoint ID exceeds bus width"); }
     reg r_data_cursor: uint(0..capacity) = 0;
     reg r_data_lasts: uint(0..=data_depth) = 0;
     return ManagerWriteEndpoint(C, id, capacity, response_depth, request_depth, data_depth).new(
@@ -253,6 +268,20 @@ fn order_capacity(Endpoints: type) -> positive {
     var capacity = 0;
     for (F in Endpoints.elements) { capacity += F.capacity; }
     return max(1, capacity);
+}
+// Endpoint labels in order queues: the bus ID type, or for AXI4-Lite (no IDs)
+// a range covering every endpoint's local label.
+fn route_type(C: type, Reads: type, Writes: type) -> type {
+    if (!C.lite) { return C.Id; }
+    var limit = 1;
+    for (F in Reads.elements) { limit = max(limit, F.id + 1); }
+    for (F in Writes.elements) { limit = max(limit, F.id + 1); }
+    return uint(0..limit);
+}
+// Read/B issue-order queues exist only for AXI4-Lite; elsewhere a one-entry
+// queue that is never pushed stands in (no state after synthesis).
+fn issue_capacity(C: type, Endpoints: type) -> positive {
+    if (C.lite) { return order_capacity(Endpoints); } else { return 1; }
 }
 fn validate_endpoints(Endpoints: type, write: bool) {
     var index = 0;
@@ -287,30 +316,63 @@ pub struct Manager(C: type, Reads: type, Writes: type) {
     channels: ManagerChannels(C), reads: Reads, writes: Writes,
     ref read_last: uint(0..max(1, Reads.len)),
     ref write_last: uint(0..max(1, Writes.len)),
-    order: ContextQueue(C.Id, order_capacity(Writes)),
+    order: ContextQueue(route_type(C, Reads, Writes), order_capacity(Writes)),
+    // AXI4-Lite only: issuing endpoint of each outstanding AR and AW, in bus
+    // order. Responses return in that order and carry no ID.
+    read_issued: ContextQueue(route_type(C, Reads, Writes), issue_capacity(C, Reads)),
+    write_issued: ContextQueue(route_type(C, Reads, Writes), issue_capacity(C, Writes)),
     fn begin(self) {
         self.channels.begin();
+        var r_routed = false;
+        var r_route: route_type(C, Reads, Writes) = 0;
         if (self.channels.r.can_pop()) {
-            val id = C.id_of(self.channels.r.peek());
-            var known = false;
-            for (F in Reads.elements) { known = known || id == F.id; }
-            assert(known, "Manager.begin(): unknown RID");
+            if (C.lite) {
+                assert(self.read_issued.can_pop(), "Manager.begin(): R without an outstanding AXI4-Lite read");
+                if (self.read_issued.can_pop()) {
+                    r_route = self.read_issued.descriptors[self.read_issued.head];
+                    r_routed = true;
+                }
+            } else {
+                val id = C.id_of(self.channels.r.peek());
+                var known = false;
+                for (F in Reads.elements) { known = known || id == F.id; }
+                assert(known, "Manager.begin(): unknown RID");
+                r_route = id;
+                r_routed = true;
+            }
         }
+        var b_routed = false;
+        var b_route: route_type(C, Reads, Writes) = 0;
         if (self.channels.b.can_pop()) {
-            val id = C.id_of(self.channels.b.peek());
-            var known = false;
-            for (F in Writes.elements) { known = known || id == F.id; }
-            assert(known, "Manager.begin(): unknown BID");
+            if (C.lite) {
+                assert(self.write_issued.can_pop(), "Manager.begin(): B without an outstanding AXI4-Lite write");
+                if (self.write_issued.can_pop()) {
+                    b_route = self.write_issued.descriptors[self.write_issued.head];
+                    b_routed = true;
+                }
+            } else {
+                val id = C.id_of(self.channels.b.peek());
+                var known = false;
+                for (F in Writes.elements) { known = known || id == F.id; }
+                assert(known, "Manager.begin(): unknown BID");
+                b_route = id;
+                b_routed = true;
+            }
         }
-        for (f in self.reads) { f.begin(self.channels.r); }
-        for (f in self.writes) { f.begin(self.channels.b); }
+        var r_taken = false;
+        for (f in self.reads) { r_taken = f.begin(self.channels.r, r_routed, r_route) || r_taken; }
+        var b_taken = false;
+        for (f in self.writes) { b_taken = f.begin(self.channels.b, b_routed, b_route) || b_taken; }
+        // Every AXI4-Lite response completes its transaction.
+        if (C.lite && r_taken) { self.read_issued.pop(); }
+        if (C.lite && b_taken) { self.write_issued.pop(); }
         for (f in self.writes) { f.check_response(self.channels.w, self.order); }
     }
     fn end(self) {
         // Forward newly submitted local beats at the same edge: Internal
         // request/data slots deliberately permit immediate push->pop chaining.
-        fn grant_read(endpoint: any) -> bool { return endpoint.flush_ar(self.channels.ar); }
-        fn grant_write(endpoint: any) -> bool { return endpoint.flush_aw(self.channels.aw, self.order); }
+        fn grant_read(endpoint: any) -> bool { return endpoint.flush_ar(self.channels.ar, self.read_issued); }
+        fn grant_write(endpoint: any) -> bool { return endpoint.flush_aw(self.channels.aw, self.order, self.write_issued); }
         arbitrate(self.reads, ref(self.read_last), grant_read);
         arbitrate(self.writes, ref(self.write_last), grant_write);
         for (f in self.writes) { f.flush_w(self.channels.w, self.order); }
@@ -324,9 +386,6 @@ pub fn manager(C: type, bus: RefInterface(Axi(C)),
     reads: any = (), writes: any = ()) -> Manager(C, type(reads), type(writes)) {
     type Reads = type(reads);
     type Writes = type(writes);
-    // AXI4-Lite has no IDs: responses must be routed by issue order, which
-    // this ID-routed Manager does not do yet.
-    const { assert(!C.lite, "manager(): AXI4-Lite is not supported yet"); }
     const { validate_endpoints(Reads, false); validate_endpoints(Writes, true); }
     // Empty/singleton directions use a constant zero index. Initializing to the
     // final index makes endpoint zero the first candidate after reset.
@@ -334,5 +393,7 @@ pub fn manager(C: type, bus: RefInterface(Axi(C)),
     reg r_write_last: uint(0..max(1, Writes.len)) = max(1, Writes.len) - 1;
     return Manager(C, Reads, Writes).new(channels=manager_channels(C, bus), reads=reads, writes=writes,
         read_last=ref(r_read_last), write_last=ref(r_write_last),
-        order=context_queue(C.Id, order_capacity(Writes)));
+        order=context_queue(route_type(C, Reads, Writes), order_capacity(Writes)),
+        read_issued=context_queue(route_type(C, Reads, Writes), issue_capacity(C, Reads)),
+        write_issued=context_queue(route_type(C, Reads, Writes), issue_capacity(C, Writes)));
 }

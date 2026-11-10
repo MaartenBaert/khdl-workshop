@@ -828,3 +828,65 @@ async def lite_pipeline(dut):
         assert ram_model.read(address, length) == data
         response = await master.read(address, length)
         assert response.data == data and response.resp == 0
+
+
+@cocotb.test(timeout_time=200, timeout_unit='us')
+async def lite_endpoints(dut):
+    """Two read and two write endpoints of the fixed-ID Manager on AXI4-Lite.
+    Without IDs, every response must reach its endpoint by issue order alone,
+    with stalls on all five channels and both endpoints active together."""
+    initialize_endpoints(dut)
+    cocotb.start_soon(Clock(dut.clk, 10, unit='ns').start())
+    ram = AxiLiteRam(AxiLiteBus.from_prefix(dut, 'm_axi'), dut.clk, dut.aresetn,
+                     reset_active_level=False, size=65536)
+    pause_lite(([ram.write_if.aw_channel, ram.write_if.w_channel, ram.write_if.b_channel,
+                 ram.read_if.ar_channel, ram.read_if.r_channel], [0, 1, 0, 0, 1]))
+    await reset(dut)
+    count = 12
+    tasks, completions = [], []
+    for i in range(2):
+        addresses = [4096 * i + 4 * j for j in range(count)]
+        completions.append(cocotb.start_soon(receive(dut, f'write{i}_result', count)))
+        tasks.append(cocotb.start_soon(send(dut, f'write{i}_request', addresses)))
+        tasks.append(cocotb.start_soon(send(dut, f'write{i}_data',
+                                            [(1000 * i + j) | 15 << 32 for j in range(count)])))
+    for task in tasks:
+        await task
+    for result in completions:
+        assert await result == [0] * count
+    for i in range(2):
+        for j in range(count):
+            assert ram.read(4096 * i + 4 * j, 4) == (1000 * i + j).to_bytes(4, 'little')
+    results = [cocotb.start_soon(receive(dut, f'read{i}_result', count)) for i in range(2)]
+    tasks = [cocotb.start_soon(send(dut, f'read{i}_request', [4096 * i + 4 * j for j in range(count)]))
+             for i in range(2)]
+    for task in tasks:
+        await task
+    for i, result in enumerate(results):
+        for j, value in enumerate(await result):
+            assert value & 0xffffffff == 1000 * i + j, (i, j, hex(value))
+            assert (value >> 32) & 3 == 0 and (value >> 34) & 1 == 1
+
+
+@cocotb.test(timeout_time=300, timeout_unit='us')
+async def lite_copy(dut):
+    dut.command_valid.value = 0
+    dut.command_data.value = 0
+    dut.result_ready.value = 0
+    cocotb.start_soon(Clock(dut.clk, 10, unit='ns').start())
+    ram_model = AxiLiteRam(AxiLiteBus.from_prefix(dut, 'm_axi'), dut.clk, dut.aresetn,
+                           reset_active_level=False, size=65536)
+    pause_lite(([ram_model.write_if.aw_channel, ram_model.write_if.w_channel,
+                 ram_model.write_if.b_channel, ram_model.read_if.ar_channel,
+                 ram_model.read_if.r_channel], [0, 1, 0, 0]))
+    await reset(dut)
+    for tag, (source, destination, length) in enumerate([
+        (0, 16384, 0), (64, 16384, 8), (4000, 20000, 400),
+    ]):
+        data = bytes((i * 17 + tag) % 256 for i in range(length))
+        ram_model.write(source, data)
+        ram_model.write(destination, bytes(length))
+        result = cocotb.start_soon(receive(dut, 'result', 1))
+        await send(dut, 'command', [source | destination << 32 | length << 64 | tag << 97])
+        assert (await result)[0] == tag
+        assert ram_model.read(destination, length) == data

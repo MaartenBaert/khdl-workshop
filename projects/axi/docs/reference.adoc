@@ -58,10 +58,11 @@ Rules that differ from AXI4:
   open burst's AWID as a peer error.
 * **AXI4-Lite:** every transaction is one full-width beat, with no ID, LAST,
   attributes other than PROT, or USER. Responses therefore return in issue
-  order. The Subordinate keeps them in order through its ID-0 context matching.
-  The pooled Manager supports AXI4-Lite the same way. The fixed-ID Manager
-  (`manager()`) routes responses by ID and rejects AXI4-Lite during
-  elaboration.
+  order. The Subordinate keeps them in order through its ID-0 context matching,
+  and the pooled Manager matches them the same way. The fixed-ID Manager
+  (`manager()`) records the issuing endpoint of each AR and AW in issue-order
+  queues and routes R and B from their heads (see <<axi4-manager-internals>>).
+  Its endpoint IDs are then local labels that never appear on the bus.
 
 `C.Addr`, `C.Data`, `C.Id`, and `C.Strobe` are unsigned hardware types.
 `C.bytes` is the bus width in bytes, and `C.size` is the SIZE encoding of a

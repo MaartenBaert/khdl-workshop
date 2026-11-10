@@ -82,7 +82,7 @@ pub fn axi_config(
         fn id_of(x: any) -> uint(id_width) {
             if (protocol == Protocol.Lite) { return 0; } else { return x.id; }
         }
-        fn with_id(a: any, id: uint(id_width)) -> any {
+        fn with_id(a: any, id: any) -> any {
             var result = a;
             if (protocol != Protocol.Lite) { result.id = id; }
             return result;
@@ -93,7 +93,7 @@ pub fn axi_config(
         }
         // Constructors. Fields the protocol lacks are dropped; an AXI3 W
         // carries the burst's ID (WID).
-        fn make_w(id: uint(id_width), data: uint(data_width), strb: uint(data_width / 8),
+        fn make_w(id: any, data: uint(data_width), strb: uint(data_width / 8),
             last: bool, user: uint(wuser_width)) -> W {
             match (protocol) {
                 .Lite => { return W.new(data=data, strb=strb); }
@@ -101,11 +101,11 @@ pub fn axi_config(
                 .Axi4 => { return W.new(data=data, strb=strb, last=last, user=user); }
             }
         }
-        fn make_b(id: uint(id_width), resp: uint(2), user: uint(buser_width)) -> B {
+        fn make_b(id: any, resp: uint(2), user: uint(buser_width)) -> B {
             if (protocol == Protocol.Lite) { return B.new(resp=resp); }
             else { return B.new(id=id, resp=resp, user=user); }
         }
-        fn make_r(id: uint(id_width), data: uint(data_width), resp: uint(2), last: bool,
+        fn make_r(id: any, data: uint(data_width), resp: uint(2), last: bool,
             user: uint(ruser_width)) -> R {
             if (protocol == Protocol.Lite) { return R.new(data=data, resp=resp); }
             else { return R.new(id=id, data=data, resp=resp, last=last, user=user); }

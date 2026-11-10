@@ -292,7 +292,12 @@ while each endpoint's B retirement remains local and ordered.
 
 *Response routing.* During `api.begin()`, a received R beat or B response is
 moved to the endpoint whose compile-time ID matches its RID or BID, when that
-endpoint's response buffer has space. A response with an unknown ID is an
+endpoint's response buffer has space. AXI4-Lite responses carry no ID: the
+Manager records the issuing endpoint of each AR and AW in issue-order queues
+when the request moves into the output register, and routes each response to
+the endpoint at the head of its queue. Every AXI4-Lite response completes its
+transaction and pops the queue. A response with no outstanding request is an
+assertion error. A response with an unknown ID is an
 assertion error as soon as it is received. A B response is an assertion error
 once buffered if its burst's final W beat is still in the endpoint's data
 stage or in the W output register. The check uses the existing cursor and W

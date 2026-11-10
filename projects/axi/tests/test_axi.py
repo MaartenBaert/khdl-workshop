@@ -176,11 +176,44 @@ def test_lite_request_rules():
         compiler.resolve('axi.types.write_request')(config, 0, beats=2)
 
 
-def test_lite_fixed_id_manager_rejected():
+def stream_ports(compiler, config, names):
+    ports = {}
+    for name, size, output in names:
+        forward, reverse = ('output', 'input') if output else ('input', 'output')
+        ports[name + '_data'] = (forward, size)
+        ports[name + '_valid'] = (forward, 1)
+        ports[name + '_ready'] = (reverse, 1)
+    return ports
+
+
+@pytest.mark.parametrize('width', [32, 64])
+def test_lite_copy_independent_ram(tmp_path, width):
+    # The fixed-ID Manager on AXI4-Lite: single beats, responses by issue order.
     compiler = khdl.Source.new_from_manifest_path(str(MANIFEST)).compile()
+    config = protocol_config(compiler, 'Lite', width, id_width=0)
+    verilog = compiler.resolve('examples.copy.AxiCopy')(config).as_verilog()
+    ports = stream_ports(compiler, config, [
+        ('command', compiler.resolve('examples.copy.CopyCommand')(config).size_bits, False),
+        ('result', compiler.resolve('examples.copy.CopyResult').size_bits, True)])
+    run_cocotb(tmp_path, verilog, config, {'bus': ('m_axi', 'Manager')}, 'lite_copy', ports)
+
+
+def test_lite_endpoints_route_by_issue_order(tmp_path):
+    source = khdl.Source.new_from_manifest_path(str(MANIFEST))
+    probe = Path(__file__).parent / 'rtl/endpoints.kh'
+    source.add_file_content(['endpoints_probe'], str(probe), probe.read_text())
+    compiler = source.compile()
     config = protocol_config(compiler, 'Lite', 32, id_width=0, addr_width=16)
-    with pytest.raises(khdl.DiagnosticException, match='AXI4-Lite is not supported yet'):
-        compiler.resolve('examples.copy.AxiCopy')(config).as_verilog()
+    module = compiler.resolve('endpoints_probe.EndpointsProbe')(config)
+    names = []
+    for i in range(2):
+        names += [(f'read{i}_request', config.Ar.size_bits, False),
+                  (f'write{i}_request', config.Aw.size_bits, False),
+                  (f'write{i}_data', compiler.resolve('endpoints_probe.WriteData')(config).size_bits, False),
+                  (f'read{i}_result', compiler.resolve('axi.manager.ReadBeat')(config).size_bits, True),
+                  (f'write{i}_result', compiler.resolve('axi.manager.WriteCompletion')(config).size_bits, True)]
+    run_cocotb(tmp_path, module.as_verilog(), config, {'bus': ('m_axi', 'Manager')}, 'lite_endpoints',
+               stream_ports(compiler, config, names))
 
 
 @pytest.mark.parametrize('width,capacity,depth', [(32, 2, 1), (64, 3, 2)])

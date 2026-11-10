@@ -45,8 +45,8 @@ types. API and example code must not read or construct protocol-specific payload
 fields directly; use the configuration accessors and constructors (`C.len_of`,
 `C.id_of`, `C.exclusive`, `C.last_of`, `C.make_w`, ...) so one implementation
 serves all three. Protocol-only rules go behind compile-time `if (C.axi3)` /
-`match (C.protocol)` branches. The fixed-ID `manager()` rejects AXI4-Lite until
-order-based response routing exists. Test peers: cocotbext-axi models AXI4 and
+`match (C.protocol)` branches. On AXI4-Lite the fixed-ID `manager()` routes R/B
+by issue order (`read_issued`/`write_issued` queues); its endpoint IDs are local labels. Test peers: cocotbext-axi models AXI4 and
 AXI4-Lite; AXI3 buses are presented to them through the wrapper's AXI4 view, with
 test-side WID driving/checking (`axi_cocotb.py`).
 
