@@ -1,0 +1,55 @@
+// Formal-only facade around the fixed-ID Manager API. Application inputs are
+// unconstrained wires; the facade applies only the API's usage contract: push
+// when can_push() and only valid requests, push data when can_push_data() and
+// strobe only the beat's byte lanes. The AXI protocol monitor then checks every
+// bus signal the Manager drives.
+import axi.types.AxiDefault;
+import axi.interfaces.Axi;
+import axi.manager.[manager, read_endpoint, write_endpoint];
+import axi.burst.[valid_request, lane_mask];
+
+fn drive_read(C: type, endpoint: any, valid: bool, request: C.Ar, ready: bool) {
+    if (valid && endpoint.can_push() && valid_request(C, request)) { endpoint.push(request); }
+    if (ready && endpoint.can_pop()) { val _ = endpoint.pop(); }
+}
+
+fn drive_write(C: type, endpoint: any, valid: bool, request: C.Aw,
+    data_valid: bool, data: C.Data, strb: C.Strobe, ready: bool) {
+    if (valid && endpoint.can_push() && valid_request(C, request)) { endpoint.push(request); }
+    if (data_valid && endpoint.can_push_data()) {
+        // The API has no lane query; read the beat's context directly.
+        val token = endpoint.data_cursor;
+        val count = endpoint.contexts.beats[token];
+        if (count < 256) {
+            val mask = lane_mask(C, endpoint.contexts.descriptors[token], count);
+            val _ = endpoint.push_data(data, strb & mask);
+        }
+    }
+    if (ready && endpoint.can_pop()) { val _ = endpoint.pop(); }
+}
+
+// Two read and two write endpoints with IDs 0 and 1, so the bus carries
+// interleaved reads, reordered write responses, and shared-channel arbitration.
+pub module AxiFormalManager(C: type = AxiDefault, capacity: positive = 2) ports(
+    clk: in clock, rst: in async bool,
+    sync(clk, async rst) {
+        bus: interface Axi(C).Manager,
+        read_valid: in [2]bool, read_request: in [2]C.Ar, read_ready: in [2]bool,
+        write_valid: in [2]bool, write_request: in [2]C.Aw, write_ready: in [2]bool,
+        data_valid: in [2]bool, data: in [2]C.Data, strb: in [2]C.Strobe,
+    }
+) {
+    clocked(clk, async rst) {
+        val read0 = read_endpoint(C, id=0, capacity=capacity);
+        val read1 = read_endpoint(C, id=1, capacity=capacity);
+        val write0 = write_endpoint(C, id=0, capacity=capacity);
+        val write1 = write_endpoint(C, id=1, capacity=capacity);
+        val api = manager(C, ref(bus), reads=(read0, read1), writes=(write0, write1));
+        api.begin();
+        drive_read(C, read0, read_valid[0], read_request[0], read_ready[0]);
+        drive_read(C, read1, read_valid[1], read_request[1], read_ready[1]);
+        drive_write(C, write0, write_valid[0], write_request[0], data_valid[0], data[0], strb[0], write_ready[0]);
+        drive_write(C, write1, write_valid[1], write_request[1], data_valid[1], data[1], strb[1], write_ready[1]);
+        api.end();
+    }
+}

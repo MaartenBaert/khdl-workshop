@@ -10,8 +10,9 @@ From the repository root:
 .venv/bin/python -m projects.axi.tools.compile --check
 .venv/bin/python -m projects.axi.tools.compile
 .venv/bin/pytest projects/axi/tests
-.venv/bin/python -m projects.axi.tools.formal --depth 12
-.venv/bin/python -m projects.axi.tools.formal --target error --depth 8 --out build/axi/formal-error
+.venv/bin/python -m projects.axi.tools.formal --target pipeline --unbounded
+.venv/bin/python -m projects.axi.tools.formal --target error
+.venv/bin/python -m projects.axi.tools.formal --target manager
 .venv/bin/python docs/build.py
 ----
 
@@ -19,7 +20,8 @@ The `--check` run elaborates the concrete profiles in `rtl/channel/examples.kh`,
 `rtl/channel/ref_self.kh`, and `rtl/examples/checks.kh`. Without it, the tool also
 exports the demonstration modules to `build/axi/verilog/`. `setup.sh` installs
 the Python test dependencies, including cocotb 2.x and cocotbext-axi 0.1.x.
-Verilator is required; Yosys is required for the formal test and tool. Builds
+Verilator is required; Yosys is required for the formal test and tool, and
+ABC with `yosys-witness` makes it faster and enables unbounded proofs. Builds
 use ignored paths or pytest temporary directories.
 
 [[axi-channel-verification]]
@@ -53,30 +55,61 @@ and incorrect endpoint roles. Private KHDL test facades live under
 `tests/rtl/`, outside the production API.
 
 [[axi4-formal]]
-=== Bounded formal checks
+=== Formal checks
 
-The Yosys SAT harness checks all five channels of a small `AxiPipeline` with
-independent two-entry scoreboards. Assertions cover capacity, absence of
-phantom outputs, payload order, and stalled output stability. Peers must hold
-stalled inputs; reset is asserted initially and then released. A corrupted-AW
-negative control must produce a counterexample. The 12-cycle run is bounded
-transport safety, not an unbounded proof, a liveness result, or
-transaction-wide formal verification.
+`tools/formal.py` exports a module, wraps it in a generated harness, and uses
+ABC, or Yosys's built-in SAT solver when ABC is not installed, to check every
+behavior within a fixed number of cycles after reset. For `AxiPipeline`, ABC's
+PDR engine also proves the properties for any number of cycles.
+Reset is asserted in the first cycle and is unconstrained afterwards, so
+resets during transactions are included. Every KHDL runtime assertion in the
+export is also a proof obligation (<<axi-verification-synthesis>>).
 
-A second bounded harness checks `AxiError` with two context slots, one-bit IDs,
-and two-beat bursts: correct counts, IDs, LAST, DECERR, B dependencies, stalled
-outputs, and reset. Address attributes are fixed to legal byte-wide INCR
-accesses; IDs, channel availability, and response stalls are unconstrained.
-Independent scoreboards limit outstanding requests and early W bursts to four.
-A reachability check requires early W, overlapping requests, a final R transfer,
-and a B transfer in the same bounded trace, which shows that these assumptions
-permit useful progress. It does not prove eventual completion. Arbitrary burst
-lengths, Manager response interleaving, routing, and memory semantics have
-simulation coverage rather than formal proofs; broader transaction-wide
-verification remains future work.
-https://github.com/ZipCPU/wb2axip#formal-verification[ZipCPU's public full-AXI properties]
-are explicitly incomplete and do not supply a complete verification suite.
-See `formal/README.md` for the harness details.
+The AXI4 rules come from a protocol monitor, `formal/axi4_protocol.sv`, written
+from the specification rather than from this implementation. It checks reset
+and handshake rules, request legality (burst type, length, size, 4 KiB
+boundaries, WRAP alignment, exclusive-access restrictions, and AxCACHE
+encodings), WLAST and WSTRB for each beat, W ordering, RID/BID matching,
+RLAST, same-ID ordering, and B only after both AW and the final W beat. Rules
+for the module under test are assertions. Rules for the other side are
+assumptions, so the environment may do anything the specification allows:
+W before AW, interleaved reads and reordered responses with different IDs,
+narrow, unaligned, FIXED, WRAP, and exclusive bursts, any legal attributes,
+and arbitrary stalls.
+
+[options="header",cols="1,2,3"]
+|===
+|Target |Module under test |Checks
+|`pipeline` |`AxiPipeline` |Design contract: each channel delivers exactly its
+input beats, in order, with at most two in flight. Stalled outputs stay
+stable, and VALID is low in and after reset. Inputs need not be legal AXI.
+|`error` |`AxiError` as a Subordinate |Protocol monitor, plus the design
+contract that every R and B response is DECERR.
+|`manager` |Fixed-ID Manager with two read and two write endpoints (IDs 0 and 1)
+|Protocol monitor. Application requests and data are arbitrary within the API
+usage contract; the Subordinate's responses are arbitrary within the
+specification.
+|===
+
+Each target has a negative control that must fail: a corrupted AW payload,
+a flipped RLAST, and a reserved AR burst encoding, respectively. For `error`
+and `manager`, a reachability run must find a trace with useful progress,
+such as a completed multi-beat read, a write response, and interleaved or
+early data, which shows that the assumptions are not vacuous.
+
+Apart from the unbounded `AxiPipeline` proof, these are bounded safety checks
+of small configurations. They do not show that transactions complete. Long bursts and longer
+transaction sequences are covered only up to the checked depth, a few cycles,
+because runtime grows steeply with depth. The `manager` target checks the
+signals the Manager drives and its own assertions, not that responses reach
+the right endpoint. That, `AxiRam` data integrity, the pooled Manager,
+`AxiRouter`, and `AxiCopy` have simulation coverage rather than formal checks.
+https://github.com/ZipCPU/wb2axip#formal-verification[ZipCPU's public full-AXI4
+properties] are a deliberately reduced subset that is not intended to build, and
+it assumes that W never precedes AW. The monitor here covers its protocol-rule
+categories from the specification instead, except bounded response delays and
+exclusive-monitor behavior. See `formal/README.md` for commands, configurations,
+depths, and how to read counterexamples.
 
 [[axi-verification-synthesis]]
 === Synthesis and remaining limits
@@ -86,9 +119,9 @@ Verilator handles these checks, but Yosys 0.66 rejects `$finish` in an always
 block. https://github.com/khdl-lang/khdl/issues/36[khdl#36] contains a minimal reproducer. Real exports need
 a compiler or backend synthesis guard before direct Yosys synthesis is usable.
 The formal tool therefore preserves the original export and creates an
-explicitly named formal-only copy, replacing guarded failure tasks with
-assertions and removing only diagnostic text. Unexpected lowering is rejected,
-and normal RTL exports are unchanged.
+explicitly named formal-only copy. Each guarded failure task sets a sticky
+failure flag that an assertion checks, and only diagnostic text is removed.
+Unexpected lowering is rejected, and normal RTL exports are unchanged.
 
 Exploratory Yosys generic-cell experiments, with only those simulation tasks
 removed in temporary copies, have compared structures. In an earlier version,

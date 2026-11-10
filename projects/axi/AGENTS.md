@@ -28,7 +28,8 @@ application code independent of buffering latency and traversal order.
   nothing from `examples`.
 - `tools/compile.py`: hierarchy checks and example exports.
 - `tools/axi_wrapper.py`: flat-pin test interoperability adapter, not API codegen.
-- `tools/formal.py`, `formal/`: bounded transport/transaction safety and explicit assertion adapter.
+- `tools/formal.py`, `formal/`: formal checks (ABC or Yosys sat), the spec-derived AXI4 protocol
+  monitor (`formal/axi4_protocol.sv`), the Manager facade, and the assertion adapter.
 - `tests/rtl/`: private KHDL test facades, injected only by tests.
 - `tests/`: independent scoreboards, FIFO contracts, rate checks, reset,
   backpressure, lifecycle assertions, and negative elaboration checks.
@@ -158,12 +159,18 @@ Part A for AXI4 functionality; Issue L establishes current terminology.
   partial copies, but issued obligations always drain.
 - Test independent peers as well as connected endpoints. Use custom schedules
   for different-ID reordering and repeated IDs; ordinary RAM peers are insufficient.
-- Formal coverage is bounded five-channel transport and small two-beat error-target
-  transaction safety, not general transaction-wide or liveness proof. Preserve assertions in the formal adapter and require its
-  corrupted-payload negative control to fail. Do not claim direct synthesis or
-  technology timing from these checks.
+- Formal coverage: an unbounded proof of AxiPipeline transport, and bounded checks
+  of AxiError and the fixed-ID Manager against the protocol monitor. No liveness.
+  Keep protocol rules in the monitor, derived from the specification with section
+  references, never from implementation behavior; implementation-specific
+  expectations go in the harness as named design-contract checks. Environment
+  assumptions must allow everything the specification allows. Every target needs
+  a failing negative control and, with assumptions, a reachability trace. Preserve
+  every KHDL assertion in the adapter. Do not claim direct synthesis or technology
+  timing from these checks.
 
 Run `.venv/bin/pytest projects/axi/tests` after API changes and the full suite
 for shared channel/tooling changes. Setup installs cocotb/cocotbext-axi; formal
-checks require Yosys. Record compiler findings without expanding pending compiler
+checks require Yosys; ABC and yosys-witness make them faster. Keep the `sat`
+engine working as the fallback. Record compiler findings without expanding pending compiler
 PRs. Small flat signal-reference facades work around khdl#40 without changing transaction semantics.

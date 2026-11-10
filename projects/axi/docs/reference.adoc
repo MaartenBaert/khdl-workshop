@@ -82,6 +82,8 @@ WLAST and strobes. The legal requests are:
 * WRAP bursts of 2, 4, 8, or 16 beats, with a start address aligned to SIZE.
 * Exclusive (LOCK) requests with a power-of-two beat count up to 16, at most
   128 bytes in total, and an address aligned to that total size.
+* AxCACHE allocate bits (bits 3 and 2) only together with the Modifiable bit
+  (bit 1).
 
 The following matrix identifies implementation and verification coverage. It
 is not a claim of exhaustive AXI4 conformance testing.
@@ -91,20 +93,20 @@ is not a claim of exhaustive AXI4 conformance testing.
 |Feature / specification topic |Implementation |Verification
 |Independent channels, stalls; A3 handshake dependencies
 |Registered Transmitter/Receiver; AW and W captured separately
-|Random five-channel stalls and stability, W-before-AW, independent peers
+|Random five-channel stalls and stability, W-before-AW, independent peers; bounded protocol monitor
 |Reset; A3 reset requirements
 |Async reset in AXI modules; all outgoing VALID cleared; coordinated cancellation
-|Simulation reset checks; initial reset in bounded transport proof
+|Simulation reset checks; reset at any cycle in the bounded formal checks
 |Burst address/length/lane rules; A3 transaction structure
 |INCR 1..256, FIXED 1..16, WRAP 2/4/8/16; narrow and unaligned legal requests
 |Independent arithmetic reference, raw burst tests, external AxiMaster/AxiRam
 |Boundaries and malformed requests; A3 transaction structure
 |SIZE no wider than bus, no address overflow, INCR stays within 4KiB;
 WRAP beat-aligned and power-of-two span; request assertions before local issue
-|Negative request cases, WLAST/WSTRB peer violations, page crossings
+|Negative request cases, WLAST/WSTRB peer violations, page crossings; bounded protocol monitor
 |IDs and ordering; A5 transaction identifiers
 |Per-ID response association/order, different-ID interleaving, ordered W scheduling
-|Adversarial reordered B/interleaved R, repeated IDs, non-power-of-two capacity
+|Adversarial reordered B/interleaved R, repeated IDs, non-power-of-two capacity; bounded protocol monitor
 |Responses and error completion; A3 response signaling
 |All four response codes represented; errors do not shorten bursts
 |DECERR target/router, response-error injection and copy error handling

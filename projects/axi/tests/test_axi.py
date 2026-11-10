@@ -235,7 +235,8 @@ def test_all_channel_bits_and_stall_stability(simulator_build_dirs, width, id_wi
 
 @pytest.mark.parametrize('update', [dict(size=7), dict(burst=3), dict(burst=0, len=16),
     dict(burst=2, len=0), dict(burst=2, len=3, addr=129),
-    dict(addr=4095, len=1), dict(lock=True, len=2), dict(lock=True, addr=1)])
+    dict(addr=4095, len=1), dict(lock=True, len=2), dict(lock=True, addr=1),
+    dict(cache=0b0100), dict(cache=0b1001)])
 def test_invalid_request_combinations(update):
     compiler = khdl.Source.new_from_manifest_path(str(MANIFEST)).compile()
     config = compiler.resolve('axi.types.AxiDefault')
@@ -243,6 +244,17 @@ def test_invalid_request_combinations(update):
                   cache=0, prot=0, qos=0, region=0, user=0)
     fields.update(update)
     assert not compiler.resolve('axi.burst.valid_request')(config, config.Ar.new(**fields))
+
+
+def test_cache_encodings():
+    # IHI 0022H A4.4: allocate bits (3:2) require the Modifiable bit (1).
+    compiler = khdl.Source.new_from_manifest_path(str(MANIFEST)).compile()
+    config = compiler.resolve('axi.types.AxiDefault')
+    valid = compiler.resolve('axi.burst.valid_request')
+    for cache in range(16):
+        request = config.Aw.new(id=0, addr=0, len=0, size=2, burst=1, lock=False,
+                                cache=cache, prot=0, qos=0, region=0, user=0)
+        assert valid(config, request) == bool(cache & 2 or not cache & 12), cache
 
 
 def test_request_builders():

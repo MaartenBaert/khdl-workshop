@@ -5,6 +5,8 @@ pub fn valid_request(C: type, request: any) -> bool {
     val count = request.len + 1;
     val aligned = request.addr - (request.addr & (bytes - 1));
     var valid = request.size <= C.size && bytes <= 2**C.addr_width && request.burst <= C.wrap;
+    // AxCACHE allocate bits require the Modifiable bit (IHI 0022H A4.4).
+    valid = valid && ((request.cache & 2) != 0 || (request.cache & 12) == 0);
     if (request.burst == C.fixed) { valid = valid && count <= 16; }
     if (request.burst == C.wrap) {
         valid = valid && (count == 2 || count == 4 || count == 8 || count == 16)

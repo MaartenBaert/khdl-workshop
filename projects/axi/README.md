@@ -63,22 +63,26 @@ From the repository root:
 .venv/bin/python -m projects.axi.tools.compile --check
 .venv/bin/pytest projects/axi/tests
 .venv/bin/python -m projects.axi.tools.compile
-.venv/bin/python -m projects.axi.tools.formal --depth 12
+.venv/bin/python -m projects.axi.tools.formal --target manager
 .venv/bin/python docs/build.py
 ```
 
-Verilator is required for simulation, and Yosys for formal checks. Setup installs
+Verilator is required for simulation, and Yosys for formal checks; ABC makes
+them faster and enables unbounded proofs. Setup installs
 cocotb and cocotbext-axi alongside shared Python dependencies. Tests combine
 independent peers, arithmetic references, transaction scoreboards, negative API
 checks, and adversarial response schedules. Private test facades are in
 `tests/rtl/`; they are not part of the application API.
 
 Exports go to `build/axi/verilog/`; the offline manual is `build/docs/axi.html`.
-The [formal harness](formal/README.md) checks bounded transport safety, with a
-corruption negative control, and small two-beat error-target transactions with
-counts/IDs/LAST and a progress witness. Broader transaction and unbounded proofs remain future
-work. Runtime assertion lowering currently blocks direct Yosys synthesis;
-the formal tool preserves the original RTL and uses an explicit assertion adapter.
+The [formal checks](formal/README.md) cover `AxiPipeline` transport, with an
+unbounded proof, and `AxiError` and the fixed-ID Manager against an AXI4
+protocol monitor written from the specification, with bounded checks. Each
+target has a negative control, and the monitored targets a reachability trace.
+Unbounded proofs of the monitored targets, liveness, and the remaining modules
+are future work. Runtime
+assertion lowering currently blocks direct Yosys synthesis; the formal tool
+preserves the original RTL and uses an explicit assertion adapter.
 
 AXI demonstration modules use active-high asynchronous `rst`; the flat test
 adapter exposes active-low `aresetn`. Release reset synchronously and reset
