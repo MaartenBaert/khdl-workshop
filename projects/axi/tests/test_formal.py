@@ -47,6 +47,30 @@ def test_negative_control_fails(tmp_path, target):
     assert (tmp_path / 'check.vcd').is_file()
 
 
+# AXI3 and AXI4-Lite through axi_protocol_view (error and manager targets).
+PROTOCOL_CASES = [(t, p) for t in ('error', 'manager') for p in ('axi3', 'lite')]
+
+
+@needs_yosys
+@pytest.mark.parametrize('target,protocol', PROTOCOL_CASES)
+def test_protocol_bounded_checks_pass_with_reachable_progress(tmp_path, target, protocol):
+    check(tmp_path, depth(target), target=target, protocol=protocol)
+    assert (tmp_path / 'reachable.vcd').is_file()
+
+
+@needs_yosys
+@pytest.mark.parametrize('target,protocol,fault,rule', [
+    *[(t, p, True, FAULT_RULES[t]) for t, p in PROTOCOL_CASES],
+    ('manager', 'axi3', 'wid', 'wid_ok'),
+])
+def test_protocol_negative_controls_fail(tmp_path, target, protocol, fault, rule):
+    with pytest.raises(ProofFailed) as failure:
+        check(tmp_path, depth(target), target=target, protocol=protocol, inject_fault=fault)
+    if default_engine() == 'abc':
+        assert rule in str(failure.value)
+    assert (tmp_path / 'check.vcd').is_file()
+
+
 @needs_abc
 @pytest.mark.parametrize('inject_fault', [False, True])
 def test_pipeline_unbounded_proof(tmp_path, inject_fault):
