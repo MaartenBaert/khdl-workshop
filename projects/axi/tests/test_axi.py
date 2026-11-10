@@ -436,6 +436,8 @@ def native_endpoints(simulator_build_dirs):
     ('id', 'unknown RID'), ('last', 'RLAST'), ('early_b', 'unexpected response'),
     # B for a burst whose final W beat is still local or still in the W register.
     ('b_before_local_w', 'before final W transfer'), ('b_before_bus_w', 'before final W transfer'),
+    # Endpoint 5's three-deep data Fifo: the final beat is queued behind another.
+    ('b_before_queued_w', 'before final W transfer'),
 ])
 def test_endpoint_response_diagnostics(native_endpoints, fault, message, capfd):
     inst = native_endpoints.instance()
@@ -480,7 +482,25 @@ def test_endpoint_response_diagnostics(native_endpoints, fault, message, capfd):
         p.write0_data.valid = False
         for _ in range(4):
             tick(inst)
-    if fault in ('early_b', 'b_before_local_w', 'b_before_bus_w'):
+    if fault == 'b_before_queued_w':
+        # WREADY low: beat 1 fills the W register, beats 2 and 3 stay queued.
+        p.bus.wready = False
+        fields = dict(id=0, addr=0, len=2, size=2, burst=1, lock=False,
+                      cache=0, prot=0, qos=0, region=0, user=0)
+        p.write1_request.data = inst.info_ports.write1_request.data.type.new(**fields)
+        p.write1_request.valid = True
+        p.write1_data.data = inst.info_ports.write1_data.data.type.new(data=0, strb=15, user=0)
+        p.write1_data.valid = True
+        tick(inst)
+        p.write1_request.valid = False
+        for _ in range(6):
+            tick(inst)
+        p.write1_data.valid = False
+        for _ in range(2):
+            tick(inst)
+        p.bus.b = inst.info_ports.bus.b.type.new(id=5, resp=0, user=0)
+        p.bus.bvalid = True
+    elif fault in ('early_b', 'b_before_local_w', 'b_before_bus_w'):
         p.bus.b = inst.info_ports.bus.b.type.new(id=1, resp=0, user=0)
         p.bus.bvalid = True
     else:

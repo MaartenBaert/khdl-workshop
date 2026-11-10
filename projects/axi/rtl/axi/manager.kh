@@ -8,16 +8,19 @@ pub struct ReadBeat(C: type) { data: C.Data, resp: uint(2), last: bool, user: ui
 pub struct WriteCompletion(C: type) { resp: uint(2), user: uint(C.buser_width) }
 struct ReadContext { len: uint(8), lock: bool }
 
-fn response_storage(T: type, depth: positive) -> type {
+// Storage type for a depth, as channel.buffers.storage builds it: depth one is
+// an Internal slot (same-cycle push->pop chaining), deeper ones a Fifo.
+fn storage_type(T: type, depth: positive) -> type {
     if (depth == 1) { return Internal(T); }
     else { return Fifo(T, depth); }
 }
 
-pub struct ManagerReadEndpoint(C: type, endpoint_id: uint, capacity: positive, response_depth: positive) {
+pub struct ManagerReadEndpoint(C: type, endpoint_id: uint, capacity: positive, response_depth: positive,
+    request_depth: positive) {
     const id = endpoint_id;
     const capacity = capacity;
-    requests: Internal(C.Ar),
-    responses: response_storage(C.R, response_depth),
+    requests: storage_type(C.Ar, request_depth),
+    responses: storage_type(C.R, response_depth),
     contexts: ContextQueue(ReadContext, capacity),
 
     fn validate(write: bool) { assert(!write, "read endpoint bound as a writer"); }
@@ -83,13 +86,16 @@ pub struct ManagerReadEndpoint(C: type, endpoint_id: uint, capacity: positive, r
     }
 }
 
-pub struct ManagerWriteEndpoint(C: type, endpoint_id: uint, capacity: positive, response_depth: positive) {
+pub struct ManagerWriteEndpoint(C: type, endpoint_id: uint, capacity: positive, response_depth: positive,
+    request_depth: positive, data_depth: positive) {
     const id = endpoint_id;
     const capacity = capacity;
-    requests: Internal(C.Aw), data: Internal(C.W),
-    responses: response_storage(C.B, response_depth),
+    requests: storage_type(C.Aw, request_depth), data: storage_type(C.W, data_depth),
+    responses: storage_type(C.B, response_depth),
     contexts: ContextQueue(C.Aw, capacity),
     ref data_cursor: uint(0..capacity),
+    // Final beats pushed into the local data storage and not yet forwarded to W.
+    ref data_lasts: uint(0..=data_depth),
 
     fn validate(write: bool) { assert(write, "write endpoint bound as a reader"); }
     fn begin(self, input: Receiver(C.B)) {
@@ -112,14 +118,18 @@ pub struct ManagerWriteEndpoint(C: type, endpoint_id: uint, capacity: positive, 
             if (order.descriptors[order.head] == endpoint_id) {
                 val beat = self.data.pop();
                 output.push(beat);
-                if (beat.last) { order.pop(); }
+                if (beat.last) {
+                    order.pop();
+                    assert(self.data_lasts > 0, "ManagerWriteEndpoint: final beat count underflow");
+                    if (self.data_lasts > 0) { self.data_lasts = self.data_lasts - 1; }
+                }
             }
         }
     }
-    // B is legal only after its burst's final W beat transferred. Locate the
-    // oldest burst's final beat from existing state, without extra registers:
-    // it is this endpoint's only complete burst when the data cursor is one
-    // past the head. That beat is either still in the local data slot, or in
+    // B is legal only after its burst's final W beat transferred. When the data
+    // cursor is one past the head, the oldest burst is this endpoint's only
+    // complete burst, so its final beat is either still in the local data
+    // storage (counted by data_lasts, at any position in a deeper storage) or in
     // the shared W register when the most recently dequeued W-order entry
     // belongs to this endpoint. A live context keeps that entry from being
     // overwritten, because the order queue then cannot fill.
@@ -130,8 +140,7 @@ pub struct ManagerWriteEndpoint(C: type, endpoint_id: uint, capacity: positive, 
             if (head != capacity - 1) { next = head + 1; }
             val complete = self.contexts.beats[head] == self.contexts.descriptors[head].len + 1;
             if (complete && self.data_cursor == next) {
-                var pending = false;
-                if (self.data.can_pop()) { pending = self.data.peek().last; }
+                var pending = self.data_lasts > 0;
                 if (!output.can_push() && output.channel.data.last) {
                     var previous = order.descriptors.len - 1;
                     if (order.head != 0) { previous = order.head - 1; }
@@ -175,6 +184,10 @@ pub struct ManagerWriteEndpoint(C: type, endpoint_id: uint, capacity: positive, 
                 assert((strb & mask) == strb, "ManagerWriteEndpoint.push_data(): invalid strobe");
                 self.data.push(C.W.new(data=data, strb=strb, last=last, user=user));
                 self.contexts.beats[token] = count + 1;
+                if (last) {
+                    assert(self.data_lasts < data_depth, "ManagerWriteEndpoint: final beat count overflow");
+                    if (self.data_lasts < data_depth) { self.data_lasts = self.data_lasts + 1; }
+                }
             }
             if (last) {
                 if (self.data_cursor == capacity - 1) { self.data_cursor = 0; }
@@ -210,19 +223,29 @@ pub struct ManagerWriteEndpoint(C: type, endpoint_id: uint, capacity: positive, 
 
 // Endpoint constructors allocate local transaction state, independent of any
 // physical bus. Their reference-bearing results can be named and composed later.
+// request_depth (and data_depth for writes) one keeps the zero-latency Internal
+// slot: a request pushed this cycle is forwarded to the bus at the same edge.
+// Larger depths use a Fifo, which separates the application's push path from
+// the bus forwarding path at the cost of one cycle.
 pub fn read_endpoint(C: type, id: uint = 0, capacity: positive = 1,
-    response_depth: positive = 1) -> ManagerReadEndpoint(C, id, capacity, response_depth) {
+    response_depth: positive = 1, request_depth: positive = 1)
+    -> ManagerReadEndpoint(C, id, capacity, response_depth, request_depth) {
     const { assert(id < 2**C.id_width, "Manager endpoint ID exceeds bus width"); }
-    return ManagerReadEndpoint(C, id, capacity, response_depth).new(requests=internal(C.Ar),
-        responses=storage(C.R, response_depth), contexts=context_queue(ReadContext, capacity));
+    return ManagerReadEndpoint(C, id, capacity, response_depth, request_depth).new(
+        requests=storage(C.Ar, request_depth), responses=storage(C.R, response_depth),
+        contexts=context_queue(ReadContext, capacity));
 }
 pub fn write_endpoint(C: type, id: uint = 0, capacity: positive = 1,
-    response_depth: positive = 1) -> ManagerWriteEndpoint(C, id, capacity, response_depth) {
+    response_depth: positive = 1, request_depth: positive = 1, data_depth: positive = 1)
+    -> ManagerWriteEndpoint(C, id, capacity, response_depth, request_depth, data_depth) {
     const { assert(id < 2**C.id_width, "Manager endpoint ID exceeds bus width"); }
     reg r_data_cursor: uint(0..capacity) = 0;
-    return ManagerWriteEndpoint(C, id, capacity, response_depth).new(
-        requests=internal(C.Aw), data=internal(C.W), responses=storage(C.B, response_depth),
-        contexts=context_queue(C.Aw, capacity), data_cursor=ref(r_data_cursor));
+    reg r_data_lasts: uint(0..=data_depth) = 0;
+    return ManagerWriteEndpoint(C, id, capacity, response_depth, request_depth, data_depth).new(
+        requests=storage(C.Aw, request_depth), data=storage(C.W, data_depth),
+        responses=storage(C.B, response_depth),
+        contexts=context_queue(C.Aw, capacity), data_cursor=ref(r_data_cursor),
+        data_lasts=ref(r_data_lasts));
 }
 
 // Tuple element metadata permits elaboration-time sizing and validation without

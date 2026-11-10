@@ -111,7 +111,7 @@ Part A for AXI4 functionality; Issue L establishes current terminology.
 
 - Combined Manager/Subordinate begin/end owns all five child channels. Bind once
   per process and do not duplicate ownership through aliased copies.
-- Create named `read_endpoint(C, id=..., capacity=..., response_depth=...)` and
+- Create named `read_endpoint(C, id=..., capacity=..., response_depth=..., request_depth=...)` and
   `write_endpoint(...)` objects first. Pass tuples, including `(endpoint,)` for
   one member, to `manager(C, ref(bus), reads=..., writes=...)`. Its fields alias original
   register references. Omitted
@@ -119,8 +119,11 @@ Part A for AXI4 functionality; Issue L establishes current terminology.
 - Each endpoint owns a unique ID per direction, independent capacity and response
   storage. Same-endpoint results are ordered; other endpoints complete and reclaim
   storage independently. Read/write may share IDs; incorrect roles fail elaboration.
-- Local Internal request/data slots decouple endpoint creation from physical bus
-  wiring. `api.end()` forwards new work at the same edge when possible. Shared
+- Local request/data stages (`request_depth`/`data_depth`: Internal at depth one,
+  Fifo above) decouple endpoint creation from physical bus wiring. At depth one
+  `api.end()` forwards new work at the same edge when possible; a Fifo stage
+  trades one cycle for a shorter push-to-bus path. The B-before-final-W check
+  counts final beats held locally (`data_lasts`), so it holds at any depth. Shared
   AR/AW slots have independent round-robin state, reset to serve endpoint zero
   first. Use two static tuple passes (first masked after the previous winner),
   without modulo or runtime indexing. Advance only on enqueue into the shared

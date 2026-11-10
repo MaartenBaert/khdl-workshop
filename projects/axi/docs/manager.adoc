@@ -87,9 +87,10 @@ not cross a 4 KiB boundary.
 [[axi4-manager-endpoints]]
 === Creating endpoints
 
-`read_endpoint(C, id=0, capacity=1, response_depth=1)` and
-`write_endpoint(C, id=0, capacity=1, response_depth=1)` take the same
-parameters. All three parameters are elaboration-time constants:
+`read_endpoint(C, id=0, capacity=1, response_depth=1, request_depth=1)` and
+`write_endpoint(C, id=0, capacity=1, response_depth=1, request_depth=1, data_depth=1)`
+share their first four parameters; `data_depth` exists only for writes. All
+parameters are elaboration-time constants:
 
 [options="header",cols="1,4"]
 |===
@@ -109,12 +110,21 @@ parameters. All three parameters are elaboration-time constants:
  the response arrives. A depth of two or more uses a `Fifo`, which adds
  scheduling latency but separates its input and output sides (see
  <<axi-channel-reference>>).
+|`request_depth`
+|The number of pending address requests buffered before the bus. A depth of
+ one uses a single `Internal` slot: a request pushed in a cycle can be moved to
+ the AR or AW output register at the same edge. A depth of two or more uses a
+ `Fifo`, which costs one cycle of latency but keeps the application's push
+ logic (including the request checks) out of the bus forwarding path. Use it
+ when that combined path limits the clock frequency.
+|`data_depth`
+|Write endpoints only: the number of pending write-data beats buffered before
+ the W output register, with the same `Internal` or `Fifo` choice as
+ `request_depth`.
 |===
 
-Each endpoint also has its own one-entry slot for a pending address request,
-and write endpoints have one for pending write data. These slots let an
-endpoint accept work before it wins access to the bus (see
-<<axi4-manager-internals>>).
+These pending stages let an endpoint accept work before it wins access to the
+bus (see <<axi4-manager-internals>>).
 
 [[axi4-manager-attach]]
 === Attaching endpoints to the bus
@@ -249,8 +259,9 @@ rules below.
  endpoint k        pop ◄── [response buffer k] ◄── route by ID ◄── receive slot ◄── R, B
 ----
 
-*Pending slots.* Each endpoint has one `Internal` pending-address slot, and
-write endpoints also have one pending-W slot. Pushes fill these slots
+*Pending slots.* Each endpoint has a pending-address stage, and write
+endpoints also have a pending-W stage: one `Internal` slot by default, or a
+`Fifo` (`request_depth`, `data_depth`). Pushes fill these stages
 immediately. The slots let endpoint objects accept work independently of the
 physical bus, and they apply backpressure when arbitration or bus stalls
 prevent forwarding.
@@ -283,21 +294,26 @@ while each endpoint's B retirement remains local and ordered.
 moved to the endpoint whose compile-time ID matches its RID or BID, when that
 endpoint's response buffer has space. A response with an unknown ID is an
 assertion error as soon as it is received. A B response is an assertion error
-once buffered if its burst's final W beat is still in the endpoint's data slot
-or in the W output register. This check derives the beat's location from the
-existing cursor and W order state, so it needs no extra registers. An RLAST
+once buffered if its burst's final W beat is still in the endpoint's data
+stage or in the W output register. The check uses the existing cursor and W
+order state plus a count of final beats held in the data stage, so it also
+finds a final beat queued behind other beats in a deeper `Fifo`. An RLAST
 that does not match the request's length, an EXOKAY response to a
 non-exclusive request, and a B response before the endpoint has supplied all
 of its write data are assertion errors when the application peeks or pops the
 result.
 
 *Latency.* `Internal` slots allow a push followed by a pop in the same cycle.
-A newly submitted request can therefore reach the AR or AW output register
-during the same `api.end()`, and W data can follow a newly arbitrated AW at
-that edge. The extra local storage does not add a forward-latency cycle: the
-first bus transfer can still occur one cycle after the request was pushed, when
-the bus is available. Tests check simultaneous endpoints and immediate
-AR/AW/W forwarding.
+With the default depths, a newly submitted request can therefore reach the AR
+or AW output register during the same `api.end()`, and W data can follow a
+newly arbitrated AW at that edge. The extra local storage does not add a
+forward-latency cycle: the first bus transfer can still occur one cycle after
+the request was pushed, when the bus is available. The price is one
+combinational path from the application's push through the request checks and
+arbitration into the output registers. A `Fifo` stage (`request_depth` or
+`data_depth` of two or more) breaks that path at the cost of one cycle. Tests
+check simultaneous endpoints, immediate AR/AW/W forwarding at depth one, and
+the Fifo stages of a second endpoint.
 
 [[axi4-manager-progress]]
 === Avoiding deadlock: the application progress contract

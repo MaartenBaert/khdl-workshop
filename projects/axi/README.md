@@ -35,8 +35,9 @@ independent context/response queues, with no exposed transaction tokens. Results
 are ordered within an endpoint; different endpoints can complete and reuse storage
 independently. The Manager shares the named objects through their internal references. Local
 requests are forwarded at end with independent round-robin arbitration for AR and
-AW, rotating in tuple order; Internal slots
-allow forwarding at the same edge as submission. A small queue ensures W follows
+AW, rotating in tuple order; the default Internal slots
+allow forwarding at the same edge as submission, and `request_depth`/`data_depth`
+select Fifo stages that cut that path for timing. A small queue ensures W follows
 actual AW arbitration order. Omitted directions are disabled.
 
 Applications must eventually supply submitted write bursts without depending on

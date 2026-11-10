@@ -25,9 +25,11 @@ module EndpointsProbe(C: type = AxiDefault) ports(
 ) {
     clocked(clk, async rst) {
         val read0 = read_endpoint(C, id=1);
-        val read1 = read_endpoint(C, id=5, capacity=3, response_depth=2);
+        // Endpoint 5 uses Fifo request/data storage; endpoint 1 keeps the
+        // zero-latency Internal slots (test_composed_endpoints_forward_...).
+        val read1 = read_endpoint(C, id=5, capacity=3, response_depth=2, request_depth=2);
         val write0 = write_endpoint(C, id=1);
-        val write1 = write_endpoint(C, id=5, capacity=3, response_depth=3);
+        val write1 = write_endpoint(C, id=5, capacity=3, response_depth=3, request_depth=2, data_depth=3);
         val api = manager(C, ref(bus), reads=(read0, read1), writes=(write0, write1));
         val read_requests = [receiver(C.Ar, ref(read0_request)), receiver(C.Ar, ref(read1_request))];
         val write_requests = [receiver(C.Aw, ref(write0_request)), receiver(C.Aw, ref(write1_request))];
