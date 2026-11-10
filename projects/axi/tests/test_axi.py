@@ -203,6 +203,7 @@ def test_all_channel_bits_and_stall_stability(simulator_build_dirs, width, id_wi
     p.clk = False
     p.rst = True
     tick(inst)
+    tick(inst)  # khdl#45: the first edge after creation is missed; reset needs two
     p.rst = False
     for cycle in range(2000):
         for channel, path in paths.items():
@@ -299,6 +300,7 @@ def test_malformed_peer_diagnostics(native_error, fault, message, capfd):
     p.bus.bready = p.bus.rready = False
     p.rst = True
     tick(inst)
+    tick(inst)  # khdl#45: the first edge after creation is missed; reset needs two
     p.rst = False
     fields = dict(id=0, addr=0, len=0, size=2, burst=1, lock=False,
                   cache=0, prot=0, qos=0, region=0, user=0)
@@ -426,6 +428,7 @@ def test_endpoint_response_diagnostics(native_endpoints, fault, message, capfd):
         p[f'write{i}_result'].ready = True
     p.rst = True
     tick(inst)
+    tick(inst)  # khdl#45: the first edge after creation is missed; reset needs two
     p.rst = False
     if fault == 'last':
         fields = dict(id=15, addr=0, len=0, size=2, burst=1, lock=False,
@@ -488,6 +491,7 @@ def test_pooled_manager_rejects_b_before_final_w(native_bridge, capfd):
     p.read_result.ready = p.write_result.ready = True
     p.rst = True
     tick(inst)
+    tick(inst)  # khdl#45: the first edge after creation is missed; reset needs two
     p.rst = False
     fields = dict(id=3, addr=0, len=0, size=2, burst=1, lock=False,
                   cache=0, prot=0, qos=0, region=0, user=0)
@@ -521,6 +525,7 @@ def test_composed_endpoints_forward_without_an_extra_cycle(native_endpoints):
         p[f'write{i}_data'].valid = False
     p.rst = True
     tick(inst)
+    tick(inst)  # khdl#45: the first edge after creation is missed; reset needs two
     p.rst = False
     for i in range(2):
         address = dict(id=15, addr=64+64*i, len=0, size=2, burst=1, lock=False,
@@ -568,6 +573,7 @@ def arbitration_instance(compiled):
     p.bus.arready = p.bus.awready = p.bus.wready = False
     p.rst = True
     tick(inst)
+    tick(inst)  # khdl#45: the first edge after creation is missed; reset needs two
     p.rst = False
     inst.step(1)
     return inst
@@ -638,6 +644,7 @@ def test_endpoint_round_robin_idle_stall_and_reset(native_arbitration):
     p.bus.arready = p.bus.awready = p.bus.wready = False
     p.rst = True
     tick(inst)
+    tick(inst)  # khdl#45: the first edge after creation is missed; reset needs two
     assert not p.bus.arvalid and not p.bus.awvalid
     p.rst = False
     tick(inst)
