@@ -1,4 +1,6 @@
 // Explicit shared-pool alternative for forwarding externally chosen IDs.
+// Responses match the oldest open context with their ID. On AXI4-Lite every
+// ID is zero (C.id_of), so they match in issue order, as that protocol requires.
 import channel.endpoints.[Transmitter, Receiver];
 import axi.interfaces.[Axi, ManagerChannels, manager_channels];
 import axi.context.[ContextQueue, context_queue];
@@ -19,7 +21,7 @@ pub struct ManagerRead(C: type, capacity: positive) {
     fn can_push(self) -> bool { return self.contexts.can_push() && self.output.can_push(); }
     // Optional ordering policy for forwarding clients without a reorder buffer.
     // Pending requests share one ID, retaining pipelining within that ID.
-    fn can_push_ordered(self, id: C.Id) -> bool { return self.can_push() && self.contexts.only_id(id); }
+    fn can_push_ordered(self, id: C.Id) -> bool { return self.can_push() && self.contexts.only_id(C, id); }
     fn push(self, request: C.Ar) -> uint(0..capacity) {
         val available = self.can_push();
         val valid = valid_request(C, request);
@@ -39,15 +41,15 @@ pub struct ManagerRead(C: type, capacity: positive) {
         var result: ReadResult(C, capacity) = undef;
         if (self.can_pop()) {
             val payload = self.input.peek();
-            val selected = self.contexts.find_id(payload.id, ref(self.done));
+            val selected = self.contexts.find_id(C, C.id_of(payload), ref(self.done));
             assert(selected.found, "ManagerRead.peek(): unexpected response ID");
             if (selected.found) {
-                assert(payload.resp != C.exokay || self.contexts.descriptors[selected.token].lock,
+                assert(payload.resp != C.exokay || C.exclusive(self.contexts.descriptors[selected.token]),
                     "ManagerRead.peek(): EXOKAY for non-exclusive request");
-                val last = self.contexts.beats[selected.token] == self.contexts.descriptors[selected.token].len;
-                assert(payload.last == last, "ManagerRead.peek(): RLAST does not match ARLEN");
+                val last = self.contexts.beats[selected.token] == C.len_of(self.contexts.descriptors[selected.token]);
+                assert(C.last_of(payload) == last, "ManagerRead.peek(): RLAST does not match ARLEN");
                 result = ReadResult(C, capacity).new(token=selected.token, data=payload.data,
-                    resp=payload.resp, last=last, user=payload.user);
+                    resp=payload.resp, last=last, user=C.user_of(payload));
             }
         }
         return result;
@@ -79,7 +81,7 @@ pub struct ManagerWrite(C: type, capacity: positive) {
     ref data_cursor: uint(0..capacity),
 
     fn can_push(self) -> bool { return self.contexts.can_push() && self.output.can_push(); }
-    fn can_push_ordered(self, id: C.Id) -> bool { return self.can_push() && self.contexts.only_id(id); }
+    fn can_push_ordered(self, id: C.Id) -> bool { return self.can_push() && self.contexts.only_id(C, id); }
     fn push(self, request: C.Aw) -> uint(0..capacity) {
         val available = self.can_push();
         val valid = valid_request(C, request);
@@ -95,7 +97,7 @@ pub struct ManagerWrite(C: type, capacity: positive) {
     }
     fn can_push_data(self, token: uint(0..capacity)) -> bool {
         return self.contexts.contains(token) && token == self.data_cursor
-            && self.contexts.beats[token] <= self.contexts.descriptors[token].len
+            && self.contexts.beats[token] <= C.len_of(self.contexts.descriptors[token])
             && self.data.can_push();
     }
     fn push_data(self, token: uint(0..capacity), data: C.Data, strb: C.Strobe,
@@ -106,12 +108,12 @@ pub struct ManagerWrite(C: type, capacity: positive) {
         if (available) {
             val count = self.contexts.beats[token];
             val descriptor = self.contexts.descriptors[token];
-            last = count == descriptor.len;
+            last = count == C.len_of(descriptor);
             assert(count < 256, "ManagerWrite.push_data(): beat overflow");
             if (count < 256) {
                 val mask = lane_mask(C, descriptor, count);
                 assert((strb & mask) == strb, "ManagerWrite.push_data(): invalid strobe");
-                self.data.push(C.W.new(data=data, strb=strb, last=last, user=user));
+                self.data.push(C.make_w(C.id_of(descriptor), data, strb, last, user));
                 self.contexts.beats[token] = count + 1;
             }
             if (last) {
@@ -127,21 +129,21 @@ pub struct ManagerWrite(C: type, capacity: positive) {
         var result: WriteResult(C, capacity) = undef;
         if (self.can_pop()) {
             val payload = self.input.peek();
-            val selected = self.contexts.find_id(payload.id, ref(self.done));
+            val selected = self.contexts.find_id(C, C.id_of(payload), ref(self.done));
             assert(selected.found, "ManagerWrite.peek(): unexpected response ID");
             if (selected.found) {
-                assert(payload.resp != C.exokay || self.contexts.descriptors[selected.token].lock,
+                assert(payload.resp != C.exokay || C.exclusive(self.contexts.descriptors[selected.token]),
                     "ManagerWrite.peek(): EXOKAY for non-exclusive request");
-                assert(self.contexts.beats[selected.token] == self.contexts.descriptors[selected.token].len + 1,
+                assert(self.contexts.beats[selected.token] == C.len_of(self.contexts.descriptors[selected.token]) + 1,
                     "ManagerWrite.peek(): response before write data");
                 // A final beat still held in the W register belongs to the most
                 // recently completed burst, just before the data cursor.
                 var previous = capacity - 1;
                 if (self.data_cursor != 0) { previous = self.data_cursor - 1; }
-                if (!self.data.can_push() && self.data.channel.data.last) {
+                if (!self.data.can_push() && C.last_of(self.data.channel.data)) {
                     assert(selected.token != previous, "ManagerWrite.peek(): B response before final W transfer");
                 }
-                result = WriteResult(C, capacity).new(token=selected.token, resp=payload.resp, user=payload.user);
+                result = WriteResult(C, capacity).new(token=selected.token, resp=payload.resp, user=C.user_of(payload));
             }
         }
         return result;

@@ -40,6 +40,16 @@ application code independent of buffering latency and traversal order.
   order: explain a concept before relying on it, and keep the user-facing APIs
   understandable without prior AXI4 knowledge.
 
+Protocols: `axi_config(..., protocol=Protocol.Axi4|Axi3|Lite)` selects the payload
+types. API and example code must not read or construct protocol-specific payload
+fields directly; use the configuration accessors and constructors (`C.len_of`,
+`C.id_of`, `C.exclusive`, `C.last_of`, `C.make_w`, ...) so one implementation
+serves all three. Protocol-only rules go behind compile-time `if (C.axi3)` /
+`match (C.protocol)` branches. The fixed-ID `manager()` rejects AXI4-Lite until
+order-based response routing exists. Test peers: cocotbext-axi models AXI4 and
+AXI4-Lite; AXI3 buses are presented to them through the wrapper's AXI4 view, with
+test-side WID driving/checking (`axi_cocotb.py`).
+
 Use Transmitter/Receiver for channel roles and Manager/Subordinate for
 AXI transaction roles (Arm IHI 0022L section A1.3). Follow these contracts:
 

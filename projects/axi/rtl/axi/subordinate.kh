@@ -31,7 +31,7 @@ pub struct ReadPort(C: type, capacity: positive) {
     // Different IDs can interleave; the oldest context for each ID owns that
     // ID's next response. Tokens expire when the final response is enqueued.
     fn can_respond(self, token: uint(0..capacity)) -> bool {
-        val selected = self.contexts.find_id(self.contexts.descriptors[token].id, ref(self.done));
+        val selected = self.contexts.find_id(C, C.id_of(self.contexts.descriptors[token]), ref(self.done));
         return self.contexts.contains(token) && selected.found && token == selected.token && self.output.can_push();
     }
     fn address(self, token: uint(0..capacity)) -> C.Addr {
@@ -58,9 +58,9 @@ pub struct ReadPort(C: type, capacity: positive) {
         if (available) {
             val descriptor = self.contexts.descriptors[token];
             val beat = self.contexts.beats[token];
-            last = beat == descriptor.len;
-            self.output.push(C.R.new(id=descriptor.id, data=data, resp=resp, last=last, user=user));
-            assert(resp != C.exokay || descriptor.lock, "ReadPort.respond(): EXOKAY requires exclusive request");
+            last = beat == C.len_of(descriptor);
+            self.output.push(C.make_r(C.id_of(descriptor), data, resp, last, user));
+            assert(resp != C.exokay || C.exclusive(descriptor), "ReadPort.respond(): EXOKAY requires exclusive request");
             if (last) { self.done[token] = true; }
             else {
                 assert(beat < 256, "ReadPort.respond(): beat overflow");
@@ -100,7 +100,7 @@ pub struct WritePort(C: type, capacity: positive) {
     }
     fn can_pop_data(self, token: uint(0..capacity)) -> bool {
         return self.contexts.contains(token) && token == self.data_cursor
-            && self.contexts.beats[token] <= self.contexts.descriptors[token].len
+            && self.contexts.beats[token] <= C.len_of(self.contexts.descriptors[token])
             && self.data.can_pop();
     }
     fn pop_data(self, token: uint(0..capacity)) -> WriteBeat(C) {
@@ -111,14 +111,17 @@ pub struct WritePort(C: type, capacity: positive) {
             val descriptor = self.contexts.descriptors[token];
             val beat = self.contexts.beats[token];
             val payload = self.data.pop();
-            val last = beat == descriptor.len;
-            assert(payload.last == last, "WritePort.pop_data(): WLAST does not match AWLEN");
+            val last = beat == C.len_of(descriptor);
+            assert(C.last_of(payload) == last, "WritePort.pop_data(): WLAST does not match AWLEN");
+            // AXI3 permits write-data interleaving between IDs; this Subordinate
+            // declares an interleaving depth of one, so W follows AW order.
+            if (C.axi3) { assert(payload.id == C.id_of(descriptor), "WritePort.pop_data(): WID does not match AWID (interleaving unsupported)"); }
             assert(beat < 256, "WritePort.pop_data(): beat overflow");
             if (beat < 256) {
                 val mask = lane_mask(C, descriptor, beat);
                 assert((payload.strb & mask) == payload.strb, "WritePort.pop_data(): invalid WSTRB");
                 result = WriteBeat(C).new(addr=beat_address(C, descriptor, beat), data=payload.data,
-                    strb=payload.strb, last=last, user=payload.user);
+                    strb=payload.strb, last=last, user=C.user_of(payload));
                 self.contexts.beats[token] = beat + 1;
             }
             if (last) {
@@ -129,9 +132,9 @@ pub struct WritePort(C: type, capacity: positive) {
         return result;
     }
     fn can_complete(self, token: uint(0..capacity)) -> bool {
-        val selected = self.contexts.find_id(self.contexts.descriptors[token].id, ref(self.done));
+        val selected = self.contexts.find_id(C, C.id_of(self.contexts.descriptors[token]), ref(self.done));
         return self.contexts.contains(token) && selected.found && token == selected.token
-            && self.contexts.beats[token] == self.contexts.descriptors[token].len + 1
+            && self.contexts.beats[token] == C.len_of(self.contexts.descriptors[token]) + 1
             && self.output.can_push();
     }
     fn complete(self, token: uint(0..capacity), resp: uint(2) = 0,
@@ -139,9 +142,9 @@ pub struct WritePort(C: type, capacity: positive) {
         val available = self.can_complete(token);
         assert(available, "WritePort.complete(): can_complete required");
         if (available) {
-            assert(resp != C.exokay || self.contexts.descriptors[token].lock,
+            assert(resp != C.exokay || C.exclusive(self.contexts.descriptors[token]),
                 "WritePort.complete(): EXOKAY requires exclusive request");
-            self.output.push(C.B.new(id=self.contexts.descriptors[token].id, resp=resp, user=user));
+            self.output.push(C.make_b(C.id_of(self.contexts.descriptors[token]), resp, user));
             self.done[token] = true;
         }
     }

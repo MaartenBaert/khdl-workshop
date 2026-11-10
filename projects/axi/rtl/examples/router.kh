@@ -20,7 +20,7 @@ fn dispatch(C: type, capacity: positive, upstream: any, downstream: any, jobs: a
         val selected = destination(request.address.addr, base0, size0, base1, size1);
         val bases = [base0, base1];
         for (i in 0..2) {
-            if (selected == i && downstream[i].can_push_ordered(request.address.id)) {
+            if (selected == i && downstream[i].can_push_ordered(C.id_of(request.address))) {
                 val _ = upstream.pop();
                 var address = request.address;
                 val base = bases[i];

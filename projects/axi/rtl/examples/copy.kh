@@ -50,11 +50,11 @@ pub module AxiCopy(C: type = AxiDefault) ports(
             }
         }
         if (r_active && !r_burst_active && r_remaining > 0 && read.can_push() && write.can_push()) {
-            val count = min(256, min(r_remaining / C.bytes,
+            val count = min(C.max_beats, min(r_remaining / C.bytes,
                 min((4096 - (r_source & 4095)) / C.bytes,
                     (4096 - (r_destination & 4095)) / C.bytes)));
-            assert(count > 0 && count <= 256, "AxiCopy: invalid chunk");
-            if (count > 0 && count <= 256) {
+            assert(count > 0 && count <= C.max_beats, "AxiCopy: invalid chunk");
+            if (count > 0 && count <= C.max_beats) {
                 read.push(read_request(C, r_source, beats=count));
                 write.push(write_request(C, r_destination, beats=count));
                 r_chunk_bytes = count * C.bytes;

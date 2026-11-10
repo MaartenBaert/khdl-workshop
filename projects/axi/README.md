@@ -1,5 +1,8 @@
 # AXI4 transaction APIs in KHDL
 
+The library also supports AXI3 and AXI4-Lite through the configuration's
+`protocol` parameter (see [AXI3 and AXI4-Lite](docs/reference.adoc#axi-protocols)).
+
 A reusable five-channel AXI4 library that stress-tests KHDL interfaces,
 references, generics, and API-created state. Application code submits and
 services transactions through FIFO-style operations; the APIs own handshake

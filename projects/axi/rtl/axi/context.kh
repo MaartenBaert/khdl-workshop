@@ -17,24 +17,26 @@ pub struct ContextQueue(D: type, capacity: positive) {
         if (token < self.head) { distance = token + capacity - self.head; }
         return distance >= 0 && distance < self.level;
     }
-    fn only_id(self, id: any) -> bool {
+    // C supplies the protocol's ID accessor (AXI4-Lite descriptors have no ID
+    // field; all of their contexts share ID zero and therefore stay in order).
+    fn only_id(self, C: type, id: any) -> bool {
         var same = true;
         for (offset in 0..capacity) {
             var index = self.head + offset;
             if (index >= capacity) { index = index - capacity; }
-            if (offset < self.level && self.descriptors[index].id != id) { same = false; }
+            if (offset < self.level && C.id_of(self.descriptors[index]) != id) { same = false; }
         }
         return same;
     }
     // Address descriptors carry an AXI ID. Scan in acceptance order so two
     // active contexts with the same ID always match the older one first.
-    fn find_id(self, id: any, done: Ref([capacity]bool)) -> ContextMatch(capacity) {
+    fn find_id(self, C: type, id: any, done: Ref([capacity]bool)) -> ContextMatch(capacity) {
         var result = ContextMatch(capacity).new(found=false, token=0);
         for (offset in 0..capacity) {
             var index = self.head + offset;
             if (index >= capacity) { index = index - capacity; }
             if (offset < self.level && !result.found) {
-                if (!deref(done)[index] && self.descriptors[index].id == id) {
+                if (!deref(done)[index] && C.id_of(self.descriptors[index]) == id) {
                     result = ContextMatch(capacity).new(found=true, token=index);
                 }
             }

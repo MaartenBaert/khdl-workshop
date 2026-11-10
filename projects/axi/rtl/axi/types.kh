@@ -1,13 +1,30 @@
-// AXI4 wire payloads. Address and data channels retain their own USER widths.
-// Raw encoded fields stay representable so monitors can diagnose illegal peers.
+// AXI wire payloads for AXI4, AXI3 and AXI4-Lite (IHI 0022H Parts A and B).
+// Address and data channels retain their own USER widths. Raw encoded fields
+// stay representable so monitors can diagnose illegal peers.
+//
+// The APIs never access a payload field that only some protocols have: they
+// use the configuration's accessors and constructors below, which resolve the
+// protocol during elaboration.
+pub enum Protocol { Axi4, Axi3, Lite }
+
 pub fn axi_config(
     addr_width: positive = 32, data_width: positive = 32, id_width: uint = 4,
     awuser_width: uint = 0, wuser_width: uint = 0, buser_width: uint = 0,
-    aruser_width: uint = 0, ruser_width: uint = 0,
+    aruser_width: uint = 0, ruser_width: uint = 0, protocol: Protocol = Protocol.Axi4,
 ) -> type {
-    assert(data_width >= 8 && data_width <= 1024, "AXI4 data width must be 8..1024");
-    assert(2**clog2(data_width) == data_width, "AXI4 data width must be a power of two");
+    assert(data_width >= 8 && data_width <= 1024, "AXI data width must be 8..1024");
+    assert(2**clog2(data_width) == data_width, "AXI data width must be a power of two");
+    if (protocol == Protocol.Lite) {
+        // IHI 0022H B1.1: 32- or 64-bit data, no IDs, no USER signals.
+        assert(data_width == 32 || data_width == 64, "AXI4-Lite data width must be 32 or 64");
+        assert(id_width == 0, "AXI4-Lite has no ID signals: id_width must be 0");
+        assert(awuser_width == 0 && wuser_width == 0 && buser_width == 0
+            && aruser_width == 0 && ruser_width == 0, "AXI4-Lite has no USER signals");
+    }
     struct Config {
+        const protocol = protocol;
+        const axi3 = protocol == Protocol.Axi3;
+        const lite = protocol == Protocol.Lite;
         const addr_width = addr_width;
         const data_width = data_width;
         const id_width = id_width;
@@ -18,15 +35,17 @@ pub fn axi_config(
         const buser_width = buser_width;
         const aruser_width = aruser_width;
         const ruser_width = ruser_width;
+        // Longest burst a request may encode: AxLEN width, or single beats.
+        const max_beats = max_beats_of(protocol);
         type Addr = uint(addr_width);
         type Data = uint(data_width);
         type Id = uint(id_width);
         type Strobe = uint(bytes);
-        type Aw = address_payload(addr_width, id_width, awuser_width);
-        type Ar = address_payload(addr_width, id_width, aruser_width);
-        type W = write_payload(data_width, wuser_width);
-        type B = write_response(id_width, buser_width);
-        type R = read_payload(data_width, id_width, ruser_width);
+        type Aw = address_payload(protocol, addr_width, id_width, awuser_width);
+        type Ar = address_payload(protocol, addr_width, id_width, aruser_width);
+        type W = write_payload(protocol, data_width, id_width, wuser_width);
+        type B = write_response(protocol, id_width, buser_width);
+        type R = read_payload(protocol, data_width, id_width, ruser_width);
         const fixed = 0;
         const incr = 1;
         const wrap = 2;
@@ -34,50 +53,181 @@ pub fn axi_config(
         const exokay = 1;
         const slverr = 2;
         const decerr = 3;
+
+        // Accessors for address payloads (Aw or Ar). AXI4-Lite transfers are
+        // single full-width INCR beats with no ID, lock or cache attributes.
+        fn len_of(a: any) -> uint(0..256) {
+            if (protocol == Protocol.Lite) { return 0; } else { return a.len; }
+        }
+        fn size_of(a: any) -> uint(3) {
+            if (protocol == Protocol.Lite) { return clog2(data_width / 8); } else { return a.size; }
+        }
+        fn burst_of(a: any) -> uint(2) {
+            if (protocol == Protocol.Lite) { return 1; } else { return a.burst; }
+        }
+        fn cache_of(a: any) -> uint(4) {
+            if (protocol == Protocol.Lite) { return 0; } else { return a.cache; }
+        }
+        // AXI4 ARLOCK/AWLOCK is one bit (exclusive); AXI3 encodes 0 normal,
+        // 1 exclusive, 2 locked, 3 reserved.
+        fn exclusive(a: any) -> bool {
+            match (protocol) {
+                .Lite => { return false; }
+                .Axi3 => { return a.lock == 1; }
+                .Axi4 => { return a.lock; }
+            }
+        }
+        // ID of an address, response or (AXI3) write-data payload; zero
+        // where the protocol has none.
+        fn id_of(x: any) -> uint(id_width) {
+            if (protocol == Protocol.Lite) { return 0; } else { return x.id; }
+        }
+        fn with_id(a: any, id: uint(id_width)) -> any {
+            var result = a;
+            if (protocol != Protocol.Lite) { result.id = id; }
+            return result;
+        }
+        // LAST of a W or R payload; AXI4-Lite beats are always the last.
+        fn last_of(x: any) -> bool {
+            if (protocol == Protocol.Lite) { return true; } else { return x.last; }
+        }
+        // Constructors. Fields the protocol lacks are dropped; an AXI3 W
+        // carries the burst's ID (WID).
+        fn make_w(id: uint(id_width), data: uint(data_width), strb: uint(data_width / 8),
+            last: bool, user: uint(wuser_width)) -> W {
+            match (protocol) {
+                .Lite => { return W.new(data=data, strb=strb); }
+                .Axi3 => { return W.new(id=id, data=data, strb=strb, last=last, user=user); }
+                .Axi4 => { return W.new(data=data, strb=strb, last=last, user=user); }
+            }
+        }
+        fn make_b(id: uint(id_width), resp: uint(2), user: uint(buser_width)) -> B {
+            if (protocol == Protocol.Lite) { return B.new(resp=resp); }
+            else { return B.new(id=id, resp=resp, user=user); }
+        }
+        fn make_r(id: uint(id_width), data: uint(data_width), resp: uint(2), last: bool,
+            user: uint(ruser_width)) -> R {
+            if (protocol == Protocol.Lite) { return R.new(data=data, resp=resp); }
+            else { return R.new(id=id, data=data, resp=resp, last=last, user=user); }
+        }
+        fn user_of(x: any) -> any {
+            if (protocol == Protocol.Lite) { return 0; } else { return x.user; }
+        }
     }
     return Config;
 }
 
-fn address_payload(addr_width: positive, id_width: uint, user_width: uint) -> type {
-    struct Address {
-        id: uint(id_width), addr: uint(addr_width), len: uint(8),
-        size: uint(3), burst: uint(2), lock: bool, cache: uint(4),
-        prot: uint(3), qos: uint(4), region: uint(4), user: uint(user_width),
+fn max_beats_of(protocol: Protocol) -> positive {
+    match (protocol) {
+        .Axi4 => { return 256; }
+        .Axi3 => { return 16; }
+        .Lite => { return 1; }
     }
-    return Address;
 }
 
-fn write_payload(data_width: positive, user_width: uint) -> type {
-    struct Write { data: uint(data_width), strb: uint(data_width / 8), last: bool, user: uint(user_width) }
-    return Write;
+fn address_payload(protocol: Protocol, addr_width: positive, id_width: uint, user_width: uint) -> type {
+    match (protocol) {
+        .Axi4 => {
+            struct Address {
+                id: uint(id_width), addr: uint(addr_width), len: uint(8),
+                size: uint(3), burst: uint(2), lock: bool, cache: uint(4),
+                prot: uint(3), qos: uint(4), region: uint(4), user: uint(user_width),
+            }
+            return Address;
+        }
+        .Axi3 => {
+            struct Address {
+                id: uint(id_width), addr: uint(addr_width), len: uint(4),
+                size: uint(3), burst: uint(2), lock: uint(2), cache: uint(4),
+                prot: uint(3), user: uint(user_width),
+            }
+            return Address;
+        }
+        .Lite => {
+            struct Address { addr: uint(addr_width), prot: uint(3) }
+            return Address;
+        }
+    }
 }
 
-fn write_response(id_width: uint, user_width: uint) -> type {
-    struct Response { id: uint(id_width), resp: uint(2), user: uint(user_width) }
-    return Response;
+fn write_payload(protocol: Protocol, data_width: positive, id_width: uint, user_width: uint) -> type {
+    match (protocol) {
+        .Axi4 => {
+            struct Write { data: uint(data_width), strb: uint(data_width / 8), last: bool, user: uint(user_width) }
+            return Write;
+        }
+        .Axi3 => {
+            struct Write { id: uint(id_width), data: uint(data_width), strb: uint(data_width / 8), last: bool, user: uint(user_width) }
+            return Write;
+        }
+        .Lite => {
+            struct Write { data: uint(data_width), strb: uint(data_width / 8) }
+            return Write;
+        }
+    }
 }
 
-fn read_payload(data_width: positive, id_width: uint, user_width: uint) -> type {
-    struct Read { id: uint(id_width), data: uint(data_width), resp: uint(2), last: bool, user: uint(user_width) }
-    return Read;
+fn write_response(protocol: Protocol, id_width: uint, user_width: uint) -> type {
+    if (protocol == Protocol.Lite) {
+        struct Response { resp: uint(2) }
+        return Response;
+    } else {
+        struct Response { id: uint(id_width), resp: uint(2), user: uint(user_width) }
+        return Response;
+    }
+}
+
+fn read_payload(protocol: Protocol, data_width: positive, id_width: uint, user_width: uint) -> type {
+    if (protocol == Protocol.Lite) {
+        struct Read { data: uint(data_width), resp: uint(2) }
+        return Read;
+    } else {
+        struct Read { id: uint(id_width), data: uint(data_width), resp: uint(2), last: bool, user: uint(user_width) }
+        return Read;
+    }
 }
 
 pub type AxiDefault = axi_config();
 
 // Application-facing constructors use a beat count rather than AXI's LEN=count-1.
 // Manager submission validates burst/address combinations before issuing them.
+// Arguments a protocol cannot encode must keep their defaults (checked at run
+// time); `lock` selects an exclusive access, which AXI3 encodes as 1.
 pub fn read_request(C: type, addr: C.Addr, beats: uint(1..257) = 1,
     id: C.Id = 0, size: uint(3) = C.size, burst: uint(2) = C.incr, lock: bool = false,
     cache: uint(4) = 0, prot: uint(3) = 0, qos: uint(4) = 0, region: uint(4) = 0,
     user: uint(C.aruser_width) = 0) -> C.Ar {
-    return C.Ar.new(id=id, addr=addr, len=beats - 1, size=size, burst=burst,
-        lock=lock, cache=cache, prot=prot, qos=qos, region=region, user=user);
+    return address_request(C, C.Ar, addr, beats, id, size, burst, lock, cache, prot, qos, region, user);
 }
 
 pub fn write_request(C: type, addr: C.Addr, beats: uint(1..257) = 1,
     id: C.Id = 0, size: uint(3) = C.size, burst: uint(2) = C.incr, lock: bool = false,
     cache: uint(4) = 0, prot: uint(3) = 0, qos: uint(4) = 0, region: uint(4) = 0,
     user: uint(C.awuser_width) = 0) -> C.Aw {
-    return C.Aw.new(id=id, addr=addr, len=beats - 1, size=size, burst=burst,
-        lock=lock, cache=cache, prot=prot, qos=qos, region=region, user=user);
+    return address_request(C, C.Aw, addr, beats, id, size, burst, lock, cache, prot, qos, region, user);
+}
+
+fn address_request(C: type, T: type, addr: C.Addr, beats: uint(1..257), id: C.Id, size: uint(3),
+    burst: uint(2), lock: bool, cache: uint(4), prot: uint(3), qos: uint(4), region: uint(4),
+    user: any) -> T {
+    match (C.protocol) {
+        .Axi4 => {
+            return T.new(id=id, addr=addr, len=beats - 1, size=size, burst=burst,
+                lock=lock, cache=cache, prot=prot, qos=qos, region=region, user=user);
+        }
+        .Axi3 => {
+            assert(qos == 0 && region == 0, "AXI3 has no QoS or region signals");
+            // AXI3 AxLEN has four bits: bursts of at most 16 beats.
+            assert_assume(beats <= 16, "AXI3 bursts have at most 16 beats");
+            var encoded_lock: uint(2) = 0;
+            if (lock) { encoded_lock = 1; }
+            return T.new(id=id, addr=addr, len=beats - 1, size=size, burst=burst,
+                lock=encoded_lock, cache=cache, prot=prot, user=user);
+        }
+        .Lite => {
+            assert(beats == 1 && size == C.size && burst == C.incr && !lock && cache == 0
+                && qos == 0 && region == 0, "AXI4-Lite requests are single full-width beats without attributes");
+            return T.new(addr=addr, prot=prot);
+        }
+    }
 }

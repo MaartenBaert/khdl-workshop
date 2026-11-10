@@ -126,6 +126,108 @@ def test_copy_independent_ram(tmp_path):
     run_cocotb(tmp_path, verilog, config, {'bus': ('m_axi', 'Manager')}, 'copy', ports)
 
 
+def protocol_config(compiler, protocol, width, id_width=1, addr_width=32):
+    protocols = compiler.resolve('axi.types.Protocol')
+    return compiler.resolve('axi.types.axi_config')(addr_width, width, id_width, 0, 0, 0, 0, 0,
+                                                    getattr(protocols, protocol))
+
+
+@pytest.mark.parametrize('arguments,message', [
+    (dict(data_width=8), 'AXI4-Lite data width'), (dict(data_width=128), 'AXI4-Lite data width'),
+    (dict(id_width=1), 'no ID signals'), (dict(ruser_width=1), 'no USER signals'),
+])
+def test_lite_config_restrictions(arguments, message):
+    compiler = khdl.Source.new_from_manifest_path(str(MANIFEST)).compile()
+    fields = dict(addr_width=16, data_width=32, id_width=0, ruser_width=0)
+    fields.update(arguments)
+    with pytest.raises(khdl.DiagnosticException, match=message):
+        compiler.resolve('axi.types.axi_config')(fields['addr_width'], fields['data_width'],
+            fields['id_width'], 0, 0, 0, 0, fields['ruser_width'],
+            compiler.resolve('axi.types.Protocol').Lite)
+
+
+def test_axi3_request_rules():
+    compiler = khdl.Source.new_from_manifest_path(str(MANIFEST)).compile()
+    config = protocol_config(compiler, 'Axi3', 64, id_width=2)
+    request = compiler.resolve('axi.types.read_request')
+    valid = compiler.resolve('axi.burst.valid_request')
+    sixteen = request(config, 128, beats=16)
+    assert sixteen.len == 15 and sixteen.lock == 0 and valid(config, sixteen)
+    # Calls pass intervening defaults explicitly (ordered arguments).
+    exclusive = request(config, 128, beats=2, id=0, size=3, burst=1, lock=True)
+    assert exclusive.lock == 1 and valid(config, exclusive)
+    # AXI3 lock encodings: 2 locked (legal), 3 reserved.
+    fields = dict(id=0, addr=128, len=0, size=3, burst=1, lock=2, cache=0, prot=0, user=0)
+    assert valid(config, config.Ar.new(**fields))
+    fields['lock'] = 3
+    assert not valid(config, config.Ar.new(**fields))
+    with pytest.raises(khdl.DiagnosticException, match='at most 16 beats'):
+        request(config, 128, beats=17)
+
+
+def test_lite_request_rules():
+    compiler = khdl.Source.new_from_manifest_path(str(MANIFEST)).compile()
+    config = protocol_config(compiler, 'Lite', 32, id_width=0, addr_width=16)
+    request = compiler.resolve('axi.types.write_request')(
+        config, 0x123, beats=1, id=0, size=2, burst=1, lock=False, cache=0, prot=2)
+    assert request.addr == 0x123 and request.prot == 2
+    assert compiler.resolve('axi.burst.valid_request')(config, request)
+    with pytest.raises(khdl.DiagnosticException, match='single full-width beats'):
+        compiler.resolve('axi.types.write_request')(config, 0, beats=2)
+
+
+def test_lite_fixed_id_manager_rejected():
+    compiler = khdl.Source.new_from_manifest_path(str(MANIFEST)).compile()
+    config = protocol_config(compiler, 'Lite', 32, id_width=0, addr_width=16)
+    with pytest.raises(khdl.DiagnosticException, match='AXI4-Lite is not supported yet'):
+        compiler.resolve('examples.copy.AxiCopy')(config).as_verilog()
+
+
+@pytest.mark.parametrize('width,capacity,depth', [(32, 2, 1), (64, 3, 2)])
+def test_axi3_ram_independent_manager(tmp_path, width, capacity, depth):
+    compiler = khdl.Source.new_from_manifest_path(str(MANIFEST)).compile()
+    config = protocol_config(compiler, 'Axi3', width, id_width=2)
+    verilog = compiler.resolve('examples.ram.AxiRam')(
+        config, memory_bytes=8192, capacity=capacity, queue_depth=depth).as_verilog()
+    run_cocotb(tmp_path, verilog, config, {'bus': ('s_axi', 'Subordinate')}, 'axi3_ram')
+
+
+@pytest.mark.parametrize('width', [32, 64])
+def test_axi3_copy_independent_ram(tmp_path, width):
+    # The fixed-ID Manager on AXI3: at most 16-beat bursts, WID = AWID.
+    compiler = khdl.Source.new_from_manifest_path(str(MANIFEST)).compile()
+    config = protocol_config(compiler, 'Axi3', width)
+    verilog = compiler.resolve('examples.copy.AxiCopy')(config).as_verilog()
+    ports = {}
+    for name, size, output in [
+        ('command', compiler.resolve('examples.copy.CopyCommand')(config).size_bits, False),
+        ('result', compiler.resolve('examples.copy.CopyResult').size_bits, True),
+    ]:
+        forward, reverse = ('output', 'input') if output else ('input', 'output')
+        ports[name + '_data'] = (forward, size)
+        ports[name + '_valid'] = (forward, 1)
+        ports[name + '_ready'] = (reverse, 1)
+    run_cocotb(tmp_path, verilog, config, {'bus': ('m_axi', 'Manager')}, 'axi3_copy', ports)
+
+
+@pytest.mark.parametrize('width,capacity,depth', [(32, 1, 1), (64, 3, 2)])
+def test_lite_ram_independent_manager(tmp_path, width, capacity, depth):
+    compiler = khdl.Source.new_from_manifest_path(str(MANIFEST)).compile()
+    config = protocol_config(compiler, 'Lite', width, id_width=0, addr_width=16)
+    verilog = compiler.resolve('examples.ram.AxiRam')(
+        config, memory_bytes=8192, capacity=capacity, queue_depth=depth).as_verilog()
+    run_cocotb(tmp_path, verilog, config, {'bus': ('s_axi', 'Subordinate')}, 'lite_ram')
+
+
+@pytest.mark.parametrize('width', [32, 64])
+def test_lite_pipeline_independent_peers(tmp_path, width):
+    compiler = khdl.Source.new_from_manifest_path(str(MANIFEST)).compile()
+    config = protocol_config(compiler, 'Lite', width, id_width=0)
+    verilog = compiler.resolve('examples.pipeline.AxiPipeline')(config).as_verilog()
+    run_cocotb(tmp_path, verilog, config, {
+        'input': ('s_axi', 'Subordinate'), 'output': ('m_axi', 'Manager')}, 'lite_pipeline')
+
+
 @pytest.mark.parametrize('depth', [1, 2, 3])
 def test_router_independent_axi_peers(tmp_path, depth):
     compiler = khdl.Source.new_from_manifest_path(str(MANIFEST)).compile()

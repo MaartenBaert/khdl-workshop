@@ -20,7 +20,48 @@ throughout a connected hierarchy. `AxiDefault` is the default configuration.
 |`id_width` |4 |Nonnegative; zero selects the single implicit ID.
 |`awuser_width`, `wuser_width`, `buser_width`, `aruser_width`, `ruser_width`
 |0 |Independent nonnegative USER widths; zero omits the corresponding flat signal.
+|`protocol` |`Protocol.Axi4`
+|`Axi4`, `Axi3`, or `Lite` (AXI4-Lite). AXI4-Lite requires a 32- or 64-bit data
+ width, `id_width` zero, and no USER signals.
 |===
+
+[[axi-protocols]]
+==== AXI3 and AXI4-Lite
+
+The protocol changes the payload types (see <<axi4-payloads>>) and a few rules.
+The APIs and examples are written once: they read payload fields only through
+the configuration's accessors, which resolve the protocol during elaboration:
+
+[options="header",cols="2,3"]
+|===
+|Member |Meaning
+|`C.protocol`, `C.axi3`, `C.lite` |The selected protocol.
+|`C.max_beats` |Longest encodable burst: 256 (AXI4), 16 (AXI3), 1 (AXI4-Lite).
+|`C.len_of`, `C.size_of`, `C.burst_of`, `C.cache_of` |Address attributes; AXI4-Lite
+ requests read as single full-width INCR beats with no cache attributes.
+|`C.exclusive(a)` |Exclusive access: AXI4 LOCK, AXI3 LOCK == 1, never for AXI4-Lite.
+|`C.id_of(x)`, `C.with_id(a, id)` |ID of an address, response or AXI3 W payload; zero
+ where the protocol has none.
+|`C.last_of(x)`, `C.user_of(x)` |LAST of a W or R payload (always true for AXI4-Lite)
+ and its USER field (zero where absent).
+|`C.make_w`, `C.make_b`, `C.make_r` |Construct a payload; fields the protocol lacks are
+ dropped, and an AXI3 W carries its burst's ID (WID).
+|===
+
+Rules that differ from AXI4:
+
+* **AXI3:** AxLEN is 4 bits, so bursts have at most 16 beats; AxLOCK is 2 bits
+  (0 normal, 1 exclusive, 2 locked, 3 reserved and rejected); there are no QoS
+  or region fields. W carries WID. The Manager sets it to the burst's AWID and
+  never interleaves write data. The Subordinate declares a write-interleaving
+  depth of one, as AXI3 permits, and treats a WID that differs from the oldest
+  open burst's AWID as a peer error.
+* **AXI4-Lite:** every transaction is one full-width beat, with no ID, LAST,
+  attributes other than PROT, or USER. Responses therefore return in issue
+  order. The Subordinate keeps them in order through its ID-0 context matching.
+  The pooled Manager supports AXI4-Lite the same way. The fixed-ID Manager
+  (`manager()`) routes responses by ID and rejects AXI4-Lite during
+  elaboration.
 
 `C.Addr`, `C.Data`, `C.Id`, and `C.Strobe` are unsigned hardware types.
 `C.bytes` is the bus width in bytes, and `C.size` is the SIZE encoding of a
@@ -39,6 +80,10 @@ Source: `axi/types.kh` and `axi/interfaces.kh`.
 |`C.W` |`data`, `strb`, `last`, `user`
 |`C.B` |`id`, `resp`, `user`
 |`C.R` |`id`, `data`, `resp`, `last`, `user`
+|AXI3 `C.Aw`, `C.Ar` |`id`, `addr`, `len` (4 bits), `size`, `burst`, `lock` (2 bits), `cache`, `prot`, `user`
+|AXI3 `C.W` |`id`, `data`, `strb`, `last`, `user`
+|AXI4-Lite `C.Aw`, `C.Ar` |`addr`, `prot`
+|AXI4-Lite `C.W`, `C.B`, `C.R` |`data`, `strb`; `resp`; `data`, `resp`
 |===
 
 Encoded fields keep their AXI widths: LEN 8, SIZE 3, BURST 2, CACHE 4, PROT 3,
@@ -46,8 +91,10 @@ QOS 4, REGION 4, RESP 2, and LOCK/LAST 1 bit. Raw encoded fields stay
 representable, so that monitors can diagnose illegal peers.
 
 `read_request(C, addr, beats=1, ...)` and `write_request(...)` construct
-address payloads with a beat count from 1 through 256, converting it to
-`len=beats-1`. Defaults select ID zero, a full-width INCR burst, no exclusive
+address payloads with a beat count from 1 through `C.max_beats`, converting it to
+`len=beats-1`. For AXI3, `lock=true` encodes an exclusive access as 1, and QoS
+and region must stay zero. For AXI4-Lite, every argument other than `addr` and
+`prot` must keep its default. Defaults select ID zero, a full-width INCR burst, no exclusive
 access, and zero attributes and USER. Optional arguments correspond to the
 address fields above. Submission validates the complete request: constructing
 a raw payload does not make an illegal combination valid.

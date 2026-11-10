@@ -1,10 +1,11 @@
 """Independent AXI peers around a KHDL pipeline (loaded by cocotb)."""
+import collections
 import itertools
 
 import cocotb
 from cocotb.clock import Clock
 from cocotb.triggers import ClockCycles, RisingEdge, FallingEdge, Timer
-from cocotbext.axi import AxiBus, AxiMaster, AxiRam
+from cocotbext.axi import AxiBus, AxiMaster, AxiRam, AxiLiteBus, AxiLiteMaster, AxiLiteRam
 from cocotbext.axi.axi_channels import (
     AxiAWSource, AxiAWTransaction, AxiWSource, AxiWTransaction, AxiBSink,
     AxiARSource, AxiARTransaction, AxiRSink,
@@ -668,3 +669,162 @@ async def endpoints_ram(dut):
             assert value & 0xffffffff == 1000*i+j
             assert (value >> 32) & 3 == 0
             assert bool((value >> 34) & 1) == (j % beats == beats-1)
+
+
+# ---- AXI3 and AXI4-Lite (axi.types protocol parameter) ----
+
+def drive_axi3_wid(dut, prefix, master):
+    """cocotbext-axi models AXI4, which has no WID. Its master never interleaves
+    write data, so W bursts follow the order in which AW commands are queued:
+    record each AWID when the master queues it, and drive WID from the head
+    until that burst's WLAST transfers (even if W precedes AW on the wire)."""
+    ids = collections.deque()
+    channel = master.write_if.aw_channel
+    queue = channel.send
+    async def send(transaction):
+        ids.append(int(transaction.awid))
+        await queue(transaction)
+    channel.send = send
+    wid, wvalid, wready, wlast = (getattr(dut, f'{prefix}_w{name}')
+                                  for name in ('id', 'valid', 'ready', 'last'))
+    async def run():
+        while True:
+            await FallingEdge(dut.clk)
+            wid.value = ids[0] if ids else 0
+            await Timer(1, unit='ns')
+            done = int(wvalid.value) and int(wready.value) and int(wlast.value)
+            await RisingEdge(dut.clk)
+            if done:
+                ids.popleft()
+    cocotb.start_soon(run())
+
+
+async def check_axi3_manager(dut, prefix, report):
+    """AXI3 rules a Manager must follow: AxLEN fits 16 beats (by width) and
+    every W beat carries the ID of the oldest AW without its final W. An AW is
+    recorded when first presented, because W may precede the AW handshake."""
+    def sig(name):
+        return getattr(dut, f'{prefix}_{name}')
+    ids = collections.deque()
+    presented = False
+    while True:
+        await FallingEdge(dut.clk)
+        await Timer(1, unit='ns')
+        if int(sig('awvalid').value) and not presented:
+            ids.append(int(sig('awid').value))
+            presented = True
+        if int(sig('wvalid').value) and int(sig('wready').value):
+            if not ids or int(sig('wid').value) != ids[0]:
+                report.append(f'WID {int(sig("wid").value)} expected {list(ids)[:1]}')
+            elif int(sig('wlast').value):
+                ids.popleft()
+        if int(sig('awvalid').value) and int(sig('awready').value):
+            presented = False
+        await RisingEdge(dut.clk)
+
+
+@cocotb.test(timeout_time=300, timeout_unit='us')
+async def axi3_ram(dut):
+    cocotb.start_soon(Clock(dut.clk, 10, unit='ns').start())
+    master = AxiMaster(AxiBus.from_prefix(dut, 's_axi'), dut.clk, dut.aresetn,
+                       reset_active_level=False, max_burst_len=16)
+    drive_axi3_wid(dut, 's_axi', master)
+    await reset(dut)
+    pause_master(master)
+    for address, length in [(0, 1), (3, 29), (4093, 80), (1024, 600)]:
+        data = bytes((i * 53 + address) % 256 for i in range(length))
+        assert (await master.write(address, data)).resp == 0
+        response = await master.read(address, length)
+        assert response.data == data and response.resp == 0
+    # Concurrent writes with different IDs: W follows AW order, WID tracks it.
+    operations = [master.init_write(5000 + 64 * i, bytes([i + 1]) * 37, awid=i % 2)
+                  for i in range(8)]
+    for operation in operations:
+        await operation.wait()
+        assert operation.data.resp == 0
+    operations = [master.init_read(5000 + 64 * i, 37, arid=i % 2) for i in range(8)]
+    for i, operation in enumerate(operations):
+        await operation.wait()
+        assert operation.data.data == bytes([i + 1]) * 37
+    assert (await master.read(8192, 16)).resp == 3
+    assert (await master.write(8192, b'out of range')).resp == 3
+
+
+@cocotb.test(timeout_time=300, timeout_unit='us')
+async def axi3_copy(dut):
+    dut.command_valid.value = 0
+    dut.command_data.value = 0
+    dut.result_ready.value = 0
+    cocotb.start_soon(Clock(dut.clk, 10, unit='ns').start())
+    ram_model = AxiRam(AxiBus.from_prefix(dut, 'm_axi'), dut.clk, dut.aresetn,
+                       reset_active_level=False, size=65536)
+    for channel in [ram_model.write_if.aw_channel, ram_model.write_if.w_channel,
+                    ram_model.write_if.b_channel, ram_model.read_if.ar_channel,
+                    ram_model.read_if.r_channel]:
+        channel.set_pause_generator(itertools.cycle([0, 1, 0, 0]))
+    violations = []
+    await reset(dut)
+    cocotb.start_soon(check_axi3_manager(dut, 'm_axi', violations))
+    for tag, (source, destination, length) in enumerate([
+        (0, 16384, 0), (64, 16384, 8), (4000, 20000, 2400), (8000, 32000, 8192),
+    ]):
+        data = bytes((i * 17 + tag) % 256 for i in range(length))
+        ram_model.write(source, data)
+        ram_model.write(destination, bytes(length))
+        result = cocotb.start_soon(receive(dut, 'result', 1))
+        await send(dut, 'command', [source | destination << 32 | length << 64 | tag << 97])
+        assert (await result)[0] == tag
+        assert ram_model.read(destination, length) == data
+    assert not violations, violations[:5]
+
+
+def pause_lite(*interfaces):
+    for interface, pattern in interfaces:
+        for channel in interface:
+            channel.set_pause_generator(itertools.cycle(pattern))
+
+
+@cocotb.test(timeout_time=300, timeout_unit='us')
+async def lite_ram(dut):
+    cocotb.start_soon(Clock(dut.clk, 10, unit='ns').start())
+    master = AxiLiteMaster(AxiLiteBus.from_prefix(dut, 's_axi'), dut.clk, dut.aresetn,
+                           reset_active_level=False)
+    await reset(dut)
+    pause_lite(([master.write_if.aw_channel, master.write_if.w_channel, master.read_if.ar_channel,
+                 master.write_if.b_channel, master.read_if.r_channel], [0, 1, 0, 0, 1]))
+    for address, length in [(0, 1), (3, 29), (1000, 200)]:
+        data = bytes((i * 53 + address) % 256 for i in range(length))
+        assert (await master.write(address, data)).resp == 0
+        response = await master.read(address, length)
+        assert response.data == data and response.resp == 0
+    # Many single-beat transactions in flight: responses must stay in order.
+    operations = [master.init_write(4000 + 16 * i, bytes([i + 1]) * 12) for i in range(8)]
+    for operation in operations:
+        await operation.wait()
+        assert operation.data.resp == 0
+    operations = [master.init_read(4000 + 16 * i, 12) for i in range(8)]
+    for i, operation in enumerate(operations):
+        await operation.wait()
+        assert operation.data.data == bytes([i + 1]) * 12
+    assert (await master.read(8192, 4)).resp == 3
+    assert (await master.write(8192, b'oops')).resp == 3
+
+
+@cocotb.test(timeout_time=300, timeout_unit='us')
+async def lite_pipeline(dut):
+    cocotb.start_soon(Clock(dut.clk, 10, unit='ns').start())
+    master = AxiLiteMaster(AxiLiteBus.from_prefix(dut, 's_axi'), dut.clk, dut.aresetn,
+                           reset_active_level=False)
+    ram_model = AxiLiteRam(AxiLiteBus.from_prefix(dut, 'm_axi'), dut.clk, dut.aresetn,
+                           reset_active_level=False, size=65536)
+    await reset(dut)
+    pause_lite(([master.write_if.aw_channel, master.write_if.w_channel, master.read_if.ar_channel,
+                 ram_model.write_if.b_channel, ram_model.read_if.r_channel], [0, 1, 0, 0, 1]),
+               ([master.write_if.b_channel, master.read_if.r_channel, ram_model.write_if.aw_channel,
+                 ram_model.write_if.w_channel, ram_model.read_if.ar_channel], [1, 0, 0, 0]))
+    for address, length in [(0, 1), (3, 29), (4093, 80), (8192, 300)]:
+        data = bytes((i * 53 + address) % 256 for i in range(length))
+        assert (await master.write(address, data)).resp == 0
+        assert ram_model.read(address, length) == data
+        response = await master.read(address, length)
+        assert response.data == data and response.resp == 0

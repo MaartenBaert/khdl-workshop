@@ -40,7 +40,7 @@ pub module AxiRam(C: type = AxiDefault, memory_bytes: uint = 4096, capacity: pos
                 val address = api.read.address(request.token);
                 val mask = api.read.strobes(request.token);
                 val base = address - (address & (C.bytes - 1));
-                val in_range = beat_in_range(address, request.address.size, memory_bytes);
+                val in_range = beat_in_range(address, C.size_of(request.address), memory_bytes);
                 var data: C.Data = 0;
                 if (memory_bytes > 0 && in_range) {
                     for (lane in 0..C.bytes) {
@@ -61,7 +61,7 @@ pub module AxiRam(C: type = AxiDefault, memory_bytes: uint = 4096, capacity: pos
             if (api.write.can_pop_data(request.token) && completions.can_push()) {
                 val beat = api.write.pop_data(request.token);
                 val base = beat.addr - (beat.addr & (C.bytes - 1));
-                val in_range = beat_in_range(beat.addr, request.address.size, memory_bytes);
+                val in_range = beat_in_range(beat.addr, C.size_of(request.address), memory_bytes);
                 if (!in_range) { r_write_error = true; }
                 if (memory_bytes > 0 && in_range) {
                     for (lane in 0..C.bytes) {

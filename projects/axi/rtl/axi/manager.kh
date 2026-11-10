@@ -28,7 +28,7 @@ pub struct ManagerReadEndpoint(C: type, endpoint_id: uint, capacity: positive, r
         self.requests.begin(); self.responses.begin();
         if (input.can_pop()) {
             val beat = input.peek();
-            if (beat.id == endpoint_id && self.responses.can_push()) { self.responses.push(input.pop()); }
+            if (C.id_of(beat) == endpoint_id && self.responses.can_push()) { self.responses.push(input.pop()); }
         }
     }
     fn flush_ar(self, output: Transmitter(C.Ar)) -> bool {
@@ -43,12 +43,11 @@ pub struct ManagerReadEndpoint(C: type, endpoint_id: uint, capacity: positive, r
     fn push(self, request: C.Ar) {
         val available = self.can_push();
         assert(available, "ManagerReadEndpoint.push(): can_push required");
-        var address = request;
-        address.id = endpoint_id;
+        val address = C.with_id(request, endpoint_id);
         val valid = valid_request(C, address);
         assert(valid, "ManagerReadEndpoint.push(): illegal request");
         if (available && valid) {
-            val _ = self.contexts.push(ReadContext.new(len=address.len, lock=address.lock));
+            val _ = self.contexts.push(ReadContext.new(len=C.len_of(address), lock=C.exclusive(address)));
             self.requests.push(address);
         }
     }
@@ -63,9 +62,9 @@ pub struct ManagerReadEndpoint(C: type, endpoint_id: uint, capacity: positive, r
                 val token = self.contexts.head;
                 val descriptor = self.contexts.descriptors[token];
                 val last = self.contexts.beats[token] == descriptor.len;
-                assert(payload.last == last, "ManagerReadEndpoint.peek(): RLAST does not match ARLEN");
+                assert(C.last_of(payload) == last, "ManagerReadEndpoint.peek(): RLAST does not match ARLEN");
                 assert(payload.resp != C.exokay || descriptor.lock, "ManagerReadEndpoint.peek(): EXOKAY requires exclusive request");
-                result = ReadBeat(C).new(data=payload.data, resp=payload.resp, last=last, user=payload.user);
+                result = ReadBeat(C).new(data=payload.data, resp=payload.resp, last=last, user=C.user_of(payload));
             }
         }
         return result;
@@ -102,7 +101,7 @@ pub struct ManagerWriteEndpoint(C: type, endpoint_id: uint, capacity: positive, 
         self.requests.begin(); self.data.begin(); self.responses.begin();
         if (input.can_pop()) {
             val response = input.peek();
-            if (response.id == endpoint_id && self.responses.can_push()) { self.responses.push(input.pop()); }
+            if (C.id_of(response) == endpoint_id && self.responses.can_push()) { self.responses.push(input.pop()); }
         }
     }
     fn flush_aw(self, output: Transmitter(C.Aw), order: any) -> bool {
@@ -118,7 +117,7 @@ pub struct ManagerWriteEndpoint(C: type, endpoint_id: uint, capacity: positive, 
             if (order.descriptors[order.head] == endpoint_id) {
                 val beat = self.data.pop();
                 output.push(beat);
-                if (beat.last) {
+                if (C.last_of(beat)) {
                     order.pop();
                     assert(self.data_lasts > 0, "ManagerWriteEndpoint: final beat count underflow");
                     if (self.data_lasts > 0) { self.data_lasts = self.data_lasts - 1; }
@@ -138,10 +137,10 @@ pub struct ManagerWriteEndpoint(C: type, endpoint_id: uint, capacity: positive, 
             val head = self.contexts.head;
             var next = 0;
             if (head != capacity - 1) { next = head + 1; }
-            val complete = self.contexts.beats[head] == self.contexts.descriptors[head].len + 1;
+            val complete = self.contexts.beats[head] == C.len_of(self.contexts.descriptors[head]) + 1;
             if (complete && self.data_cursor == next) {
                 var pending = self.data_lasts > 0;
-                if (!output.can_push() && output.channel.data.last) {
+                if (!output.can_push() && C.last_of(output.channel.data)) {
                     var previous = order.descriptors.len - 1;
                     if (order.head != 0) { previous = order.head - 1; }
                     pending = pending || order.descriptors[previous] == endpoint_id;
@@ -155,8 +154,7 @@ pub struct ManagerWriteEndpoint(C: type, endpoint_id: uint, capacity: positive, 
     fn push(self, request: C.Aw) {
         val available = self.can_push();
         assert(available, "ManagerWriteEndpoint.push(): can_push required");
-        var address = request;
-        address.id = endpoint_id;
+        val address = C.with_id(request, endpoint_id);
         val valid = valid_request(C, address);
         assert(valid, "ManagerWriteEndpoint.push(): illegal request");
         if (available && valid) {
@@ -166,7 +164,7 @@ pub struct ManagerWriteEndpoint(C: type, endpoint_id: uint, capacity: positive, 
     }
     fn can_push_data(self) -> bool {
         return self.contexts.contains(self.data_cursor)
-            && self.contexts.beats[self.data_cursor] <= self.contexts.descriptors[self.data_cursor].len
+            && self.contexts.beats[self.data_cursor] <= C.len_of(self.contexts.descriptors[self.data_cursor])
             && self.data.can_push();
     }
     fn push_data(self, data: C.Data, strb: C.Strobe, user: uint(C.wuser_width) = 0) -> bool {
@@ -177,12 +175,13 @@ pub struct ManagerWriteEndpoint(C: type, endpoint_id: uint, capacity: positive, 
             val token = self.data_cursor;
             val count = self.contexts.beats[token];
             val descriptor = self.contexts.descriptors[token];
-            last = count == descriptor.len;
+            last = count == C.len_of(descriptor);
             assert(count < 256, "ManagerWriteEndpoint.push_data(): beat overflow");
             if (count < 256) {
                 val mask = lane_mask(C, descriptor, count);
                 assert((strb & mask) == strb, "ManagerWriteEndpoint.push_data(): invalid strobe");
-                self.data.push(C.W.new(data=data, strb=strb, last=last, user=user));
+                // An AXI3 W beat carries the burst's ID (WID): this endpoint's.
+                self.data.push(C.make_w(endpoint_id, data, strb, last, user));
                 self.contexts.beats[token] = count + 1;
                 if (last) {
                     assert(self.data_lasts < data_depth, "ManagerWriteEndpoint: final beat count overflow");
@@ -206,9 +205,9 @@ pub struct ManagerWriteEndpoint(C: type, endpoint_id: uint, capacity: positive, 
                 val payload = self.responses.peek();
                 val token = self.contexts.head;
                 val descriptor = self.contexts.descriptors[token];
-                assert(self.contexts.beats[token] == descriptor.len + 1, "ManagerWriteEndpoint.peek(): response before write data");
-                assert(payload.resp != C.exokay || descriptor.lock, "ManagerWriteEndpoint.peek(): EXOKAY requires exclusive request");
-                result = WriteCompletion(C).new(resp=payload.resp, user=payload.user);
+                assert(self.contexts.beats[token] == C.len_of(descriptor) + 1, "ManagerWriteEndpoint.peek(): response before write data");
+                assert(payload.resp != C.exokay || C.exclusive(descriptor), "ManagerWriteEndpoint.peek(): EXOKAY requires exclusive request");
+                result = WriteCompletion(C).new(resp=payload.resp, user=C.user_of(payload));
             }
         }
         return result;
@@ -292,13 +291,13 @@ pub struct Manager(C: type, Reads: type, Writes: type) {
     fn begin(self) {
         self.channels.begin();
         if (self.channels.r.can_pop()) {
-            val id = self.channels.r.peek().id;
+            val id = C.id_of(self.channels.r.peek());
             var known = false;
             for (F in Reads.elements) { known = known || id == F.id; }
             assert(known, "Manager.begin(): unknown RID");
         }
         if (self.channels.b.can_pop()) {
-            val id = self.channels.b.peek().id;
+            val id = C.id_of(self.channels.b.peek());
             var known = false;
             for (F in Writes.elements) { known = known || id == F.id; }
             assert(known, "Manager.begin(): unknown BID");
@@ -325,6 +324,9 @@ pub fn manager(C: type, bus: RefInterface(Axi(C)),
     reads: any = (), writes: any = ()) -> Manager(C, type(reads), type(writes)) {
     type Reads = type(reads);
     type Writes = type(writes);
+    // AXI4-Lite has no IDs: responses must be routed by issue order, which
+    // this ID-routed Manager does not do yet.
+    const { assert(!C.lite, "manager(): AXI4-Lite is not supported yet"); }
     const { validate_endpoints(Reads, false); validate_endpoints(Writes, true); }
     // Empty/singleton directions use a constant zero index. Initializing to the
     // final index makes endpoint zero the first candidate after reset.

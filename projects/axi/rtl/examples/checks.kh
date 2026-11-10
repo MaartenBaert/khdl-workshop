@@ -1,6 +1,6 @@
 // Concrete roots for both Python's lazy compiler and the LSP. Keep behavioral
 // checks in tests; these roots establish parameter/type/domain compatibility.
-import axi.types.[axi_config, AxiDefault, read_request, write_request];
+import axi.types.[axi_config, AxiDefault, Protocol, read_request, write_request];
 import axi.interfaces.Axi;
 import axi.manager.[manager, read_endpoint, write_endpoint];
 import examples.pipeline.AxiPipeline;
@@ -31,6 +31,28 @@ pub fn check_examples() {
     );
     AxiPipeline(C); AxiRam(C, memory_bytes=128, capacity=3);
     AxiRouter(C, capacity=1);
+    // AXI3 (Zynq-7000 HP ports): every example, including the Manager APIs.
+    for (width in [32, 64]) {
+        val C3 = axi_config(addr_width=32, data_width=width, id_width=1,
+            awuser_width=0, wuser_width=0, buser_width=0, aruser_width=0, ruser_width=0,
+            protocol=Protocol.Axi3);
+        AxiPipeline(C3);
+        AxiRam(C3, memory_bytes=128, capacity=2);
+        AxiError(C3, capacity=2);
+        AxiCopy(C3);
+        EndpointManagerCheck(C3);
+        AxiRouter(C3, capacity=2);
+    }
+    // AXI4-Lite: Subordinate-side examples and the pooled (order-matched) Manager.
+    for (width in [32, 64]) {
+        val CL = axi_config(addr_width=16, data_width=width, id_width=0,
+            awuser_width=0, wuser_width=0, buser_width=0, aruser_width=0, ruser_width=0,
+            protocol=Protocol.Lite);
+        AxiPipeline(CL);
+        AxiRam(CL, memory_bytes=128, capacity=2);
+        AxiError(CL, capacity=2);
+        AxiRouter(CL, capacity=2);
+    }
 }
 
 const { check_examples(); }
