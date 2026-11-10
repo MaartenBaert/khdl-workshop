@@ -179,6 +179,29 @@ def test_burst_arithmetic(width):
                     assert mask(config, request, beat) == sum(1 << i for i in range(lower, upper))
 
 
+@pytest.mark.parametrize('addr_width', [8, 11, 12, 13, 32])
+def test_incr_page_and_address_space_limits(addr_width):
+    # INCR bursts at 4 KB page edges and at the top of the address space,
+    # against both rules written out independently (IHI 0022H A3.4.1).
+    compiler = khdl.Source.new_from_manifest_path(str(MANIFEST)).compile()
+    config = compiler.resolve('axi.types.axi_config')(addr_width=addr_width, data_width=64)
+    valid = compiler.resolve('axi.burst.valid_request')
+    top = 2**addr_width
+    starts = {0, 1, 7, 8, top - 1, top - 8, top - 9, top - 64, top - 65}
+    pages = {0, 4096, 8192, top - 4096, top - 8192}
+    starts |= {page + d for page in pages for d in (-129, -128, -8, -1, 0, 1)}
+    for start in sorted(a for a in starts if 0 <= a < top):
+        for size in range(config.size + 1):
+            beat_bytes = 1 << size
+            for count in (1, 2, 8, 16, 17, 256):
+                aligned = start // beat_bytes * beat_bytes
+                expected = (aligned % 4096 + count * beat_bytes <= 4096
+                            and aligned + count * beat_bytes <= top)
+                request = config.Ar.new(id=0, addr=start, len=count-1, size=size, burst=1,
+                    lock=False, cache=0, prot=0, qos=0, region=0, user=0)
+                assert valid(config, request) == expected, (start, size, count)
+
+
 @pytest.mark.parametrize('width,id_width,user_width', [(8, 0, 0), (32, 4, 3), (64, 3, 5)])
 def test_all_channel_bits_and_stall_stability(simulator_build_dirs, width, id_width, user_width):
     compiler = khdl.Source.new_from_manifest_path(str(MANIFEST)).compile()

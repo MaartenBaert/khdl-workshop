@@ -3,7 +3,8 @@
 pub fn valid_request(C: type, request: any) -> bool {
     val bytes = 1 << request.size;
     val count = request.len + 1;
-    val aligned = request.addr - (request.addr & (bytes - 1));
+    // Mask, not subtract: a full-width subtraction is a long carry chain.
+    val aligned = request.addr & (2**C.addr_width - bytes);
     var valid = request.size <= C.size && bytes <= 2**C.addr_width && request.burst <= C.wrap;
     // AxCACHE allocate bits require the Modifiable bit (IHI 0022H A4.4).
     valid = valid && ((request.cache & 2) != 0 || (request.cache & 12) == 0);
@@ -13,8 +14,11 @@ pub fn valid_request(C: type, request: any) -> bool {
             && (request.addr & (bytes - 1)) == 0 && count * bytes <= 2**C.addr_width;
     }
     if (request.burst == C.incr) {
-        valid = valid && (aligned & 4095) + count * bytes <= 4096
-            && aligned + count * bytes <= 2**C.addr_width;
+        // With at least 12 address bits, a burst inside one 4 KB page cannot
+        // pass the top of the address space, so only narrower buses need the
+        // separate full-width check.
+        valid = valid && (aligned & 4095) + count * bytes <= 4096;
+        if (C.addr_width < 12) { valid = valid && aligned + count * bytes <= 2**C.addr_width; }
     }
     if (request.lock) {
         valid = valid && (count == 1 || count == 2 || count == 4 || count == 8 || count == 16)
