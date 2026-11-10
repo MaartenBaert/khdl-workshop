@@ -8,6 +8,8 @@ From the repository root:
 .venv/bin/python -m projects.axi.tools.formal --target error
 .venv/bin/python -m projects.axi.tools.formal --target manager
 .venv/bin/python -m projects.axi.tools.formal --target error --inject-fault  # must fail
+.venv/bin/python -m projects.axi.tools.formal --target manager --protocol axi3
+.venv/bin/python -m projects.axi.tools.formal --target manager --protocol axi3 --inject-fault wid  # must fail
 .venv/bin/pytest projects/axi/tests/test_formal.py
 ```
 
@@ -27,8 +29,8 @@ and WID consistency (all beats of a burst share a WID, and the k-th W burst's
 WID equals the k-th AWID, also when W precedes AW). Verified 2026-11-10 at the
 default depths, with ABC: `error` and `manager` pass with reachability on both
 protocols; the RLAST, reserved-BURST, and (AXI3) `--inject-fault wid` negative
-controls fail with `rlast_ok`, `ar_legal_ok`, and `wid_ok`. These runs are not
-yet part of `tests/test_formal.py`.
+controls fail with `rlast_ok`, `ar_legal_ok`, and `wid_ok`. `tests/test_formal.py`
+runs these checks and controls for both protocols.
 
 ## Engines
 
@@ -93,7 +95,9 @@ harness limits, not AXI rules.
 | `error` | `AxiError`, two contexts | Protocol monitor as Subordinate; design contract: every R and B response is DECERR. |
 | `manager` | `formal/manager.kh`: fixed-ID Manager with read and write endpoints for IDs 0 and 1, capacity two each | Protocol monitor as Manager. The facade's application inputs are arbitrary except for the API usage contract: push when allowed, only valid requests, strobes within the beat's lanes. |
 
-`error` and `manager` use 12-bit addresses, 16-bit data, and one-bit IDs.
+`error` and `manager` use 12-bit addresses, 16-bit data, and one-bit IDs; with
+`--protocol lite`, 32-bit data and no IDs (the Manager facade's endpoint IDs are
+then local labels, and responses are routed by issue order).
 
 Each target has a negative control (`--inject-fault`) that must fail:
 `pipeline` inverts the forwarded AW payload, `error` flips RLAST as seen by the
